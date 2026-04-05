@@ -8,6 +8,10 @@ import urllib.request
 import urllib.parse
 from datetime import datetime, timedelta
 from typing import Optional
+import struct
+import zlib
+import xml.etree.ElementTree as _ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -80,6 +84,205 @@ def load_dooh_df() -> pd.DataFrame:
         ])
 
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plateau 道路ネットワーク取得
+# ─────────────────────────────────────────────────────────────────────────────
+_GML_NS  = "http://www.opengis.net/gml"
+_TRAN_NS = "http://www.opengis.net/citygml/transportation/2.0"
+_TRAN_NS1= "http://www.opengis.net/citygml/transportation/1.0"
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def _fetch_plateau_catalog_road() -> dict:
+    catalog = {}
+    rows_per_page, start = 100, 0
+    while True:
+        url = (f"https://www.geospatial.jp/ckan/api/3/action/package_search"
+               f"?fq=tags:PLATEAU&rows={rows_per_page}&start={start}")
+        with urllib.request.urlopen(url, timeout=20) as r:
+            data = json.loads(r.read())
+        results = data["result"]["results"]
+        total   = data["result"]["count"]
+        for item in results:
+            name = item.get("name", "")
+            m = re.match(r"^plateau-(\d{5})-.*-(\d{4})$", name)
+            if m:
+                muni_cd = m.group(1); year = int(m.group(2))
+                if not catalog.get(muni_cd) or int(catalog[muni_cd].split("-")[-1]) < year:
+                    catalog[muni_cd] = name
+        start += rows_per_page
+        if start >= total:
+            break
+    return catalog
+
+
+def _gsi_muni_code(lat: float, lon: float) -> Optional[str]:
+    url = (f"https://mreversegeocoder.gsi.go.jp/reverse-geocoder/"
+           f"LonLatToAddress?lat={lat}&lon={lon}")
+    try:
+        with urllib.request.urlopen(url, timeout=10) as r:
+            return json.loads(r.read())["results"]["muniCd"]
+    except Exception:
+        return None
+
+
+def _plateau_zip_url(dataset_id: str) -> Optional[str]:
+    url = f"https://www.geospatial.jp/ckan/api/3/action/package_show?id={dataset_id}"
+    try:
+        with urllib.request.urlopen(url, timeout=15) as r:
+            data = json.loads(r.read())
+        for res in data["result"]["resources"]:
+            rname = res.get("name", ""); rurl = res.get("url", "")
+            if "CityGML" in rname and rurl.endswith(".zip"):
+                if "v3" in rname or "v3" in rurl:
+                    return rurl
+        for res in data["result"]["resources"]:
+            rurl = res.get("url", "")
+            if "CityGML" in res.get("name", "") and rurl.endswith(".zip"):
+                return rurl
+    except Exception:
+        pass
+    return None
+
+
+def _zip_cd_for_layer(zip_url: str, layer: str) -> dict:
+    req = urllib.request.Request(zip_url, headers={"Range": "bytes=-65536"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        tail = r.read()
+    pos = tail.rfind(b"PK\x05\x06")
+    if pos == -1:
+        raise ValueError("ZIP EOCD not found")
+    eocd = tail[pos:]
+    cd_size   = struct.unpack_from("<I", eocd, 12)[0]
+    cd_offset = struct.unpack_from("<I", eocd, 16)[0]
+    with urllib.request.urlopen(
+        urllib.request.Request(
+            zip_url, headers={"Range": f"bytes={cd_offset}-{cd_offset+cd_size-1}"}),
+        timeout=30) as r:
+        cd_data = r.read()
+    files = {}
+    off = 0
+    while off + 46 <= len(cd_data):
+        if cd_data[off:off+4] != b"PK\x01\x02":
+            break
+        method      = struct.unpack_from("<H", cd_data, off+10)[0]
+        comp_size   = struct.unpack_from("<I", cd_data, off+20)[0]
+        fname_len   = struct.unpack_from("<H", cd_data, off+28)[0]
+        extra_len   = struct.unpack_from("<H", cd_data, off+30)[0]
+        comment_len = struct.unpack_from("<H", cd_data, off+32)[0]
+        local_off   = struct.unpack_from("<I", cd_data, off+42)[0]
+        fname = cd_data[off+46:off+46+fname_len].decode("utf-8", errors="replace")
+        if layer in fname and fname.endswith(".gml"):
+            files[fname.split("/")[-1]] = (local_off, comp_size, method)
+        off += 46 + fname_len + extra_len + comment_len
+    return files
+
+
+def _extract_gml(zip_url: str, local_off: int, comp_size: int, method: int) -> bytes:
+    with urllib.request.urlopen(
+        urllib.request.Request(
+            zip_url, headers={"Range": f"bytes={local_off}-{local_off+29}"}),
+        timeout=30) as r:
+        lh = r.read()
+    data_start = local_off + 30 + struct.unpack_from("<H", lh, 26)[0] + struct.unpack_from("<H", lh, 28)[0]
+    with urllib.request.urlopen(
+        urllib.request.Request(
+            zip_url, headers={"Range": f"bytes={data_start}-{data_start+comp_size-1}"}),
+        timeout=90) as r:
+        comp = r.read()
+    return zlib.decompress(comp, -15) if method == 8 else comp
+
+
+def _encode_mesh3(lat: float, lon: float) -> str:
+    p  = int(lat * 1.5);          u  = int(lon) - 100
+    q  = int((lat * 1.5 - p) * 8); v  = int((lon - int(lon)) * 8)
+    r  = int(((lat * 1.5 - p) * 8 - q) * 10)
+    w  = int((((lon - int(lon)) * 8 - v)) * 10)
+    return f"{p:02d}{u:02d}{q}{v}{r}{w}"
+
+
+def parse_citygml_roads(gml_bytes: bytes) -> list:
+    try:
+        root = _ET.fromstring(gml_bytes)
+    except Exception:
+        return []
+    dim = 3
+    for el in root.iter():
+        sd = el.get(f"{{{_GML_NS}}}srsDimension") or el.get("srsDimension")
+        if sd:
+            dim = int(sd); break
+    srs = next((el.get("srsName") for el in root.iter() if el.get("srsName")), "")
+    swap = not ("4326" in srs or "WGS" in srs.upper())
+    tran = _TRAN_NS if root.find(f".//{{{_TRAN_NS}}}Road") is not None else _TRAN_NS1
+    result = []
+    for road in root.findall(f".//{{{tran}}}Road"):
+        for pos_el in road.iter(f"{{{_GML_NS}}}posList"):
+            text = (pos_el.text or "").strip()
+            if not text:
+                continue
+            vals = [float(v) for v in text.split()]
+            pts = [(vals[i+1], vals[i]) if swap else (vals[i], vals[i+1])
+                   for i in range(0, len(vals) - dim + 1, dim)]
+            if len(pts) >= 2:
+                result.append(pts)
+    return result
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_plateau_roads(center_lat: float, center_lon: float,
+                         radius_m: float) -> tuple:
+    """Plateau CityGML から道路中心線を取得。GMLを並列ダウンロードで高速化。
+    Returns (road_segments, status_msg)"""
+    lat_sc = 111320.0
+    lon_sc = 111320.0 * math.cos(math.radians(center_lat))
+    dlat = radius_m / lat_sc * 1.2
+    dlon = radius_m / lon_sc * 1.2
+
+    mesh_sz_lat = (2.0/3.0) / 80
+    mesh_sz_lon = 1.0 / 80
+    prefixes: set = set()
+    la = math.floor((center_lat - dlat) / mesh_sz_lat) * mesh_sz_lat
+    while la <= center_lat + dlat + mesh_sz_lat:
+        lo = math.floor((center_lon - dlon) / mesh_sz_lon) * mesh_sz_lon
+        while lo <= center_lon + dlon + mesh_sz_lon:
+            prefixes.add(_encode_mesh3(la + mesh_sz_lat/2, lo + mesh_sz_lon/2)[:8])
+            lo += mesh_sz_lon
+        la += mesh_sz_lat
+
+    catalog = _fetch_plateau_catalog_road()
+    muni_cd = _gsi_muni_code(center_lat, center_lon)
+    if not muni_cd:
+        return [], "❌ 市区町村コード取得失敗"
+    dataset_id = catalog.get(muni_cd)
+    if not dataset_id:
+        return [], f"⚠️ {muni_cd} の Plateau データなし"
+    zip_url = _plateau_zip_url(dataset_id)
+    if not zip_url:
+        return [], "⚠️ ZIP URL 取得失敗"
+
+    cd = _zip_cd_for_layer(zip_url, "tran")
+    needed = {f: info for f, info in cd.items()
+              if any(f.startswith(p) for p in prefixes)}
+    if not needed:
+        return [], "⚠️ 対象エリアの道路 GML なし"
+
+    # GML ファイルを並列ダウンロード（最大 6 並列）
+    all_segs: list = []
+
+    def _fetch_one(item):
+        _, (off, comp_sz, method) = item
+        try:
+            return parse_citygml_roads(_extract_gml(zip_url, off, comp_sz, method))
+        except Exception:
+            return []
+
+    with ThreadPoolExecutor(max_workers=min(6, len(needed))) as ex:
+        for segs in ex.map(_fetch_one, needed.items()):
+            all_segs.extend(segs)
+
+    return all_segs, f"✅ Plateau 道路セグメント {len(all_segs):,} 本取得"
 
 
 def build_road_network(road_segments: list):
@@ -1183,40 +1386,58 @@ elif mode == "🗺️ 来店直前の経路特定":
     st.divider()
     st.header("④ 来店直前の経路特定")
     st.caption(
-        "百貨店到着前の GPS 滞留点を OSM 道路ネットワーク上にスナップし、"
+        "百貨店到着前の GPS 滞留点を Plateau 道路ネットワーク上にスナップし、"
         "Dijkstra 最短経路で道路沿いの移動経路を推定します。"
         "チラシ・ポスター配布の最適場所を特定します。"
     )
 
-    col_ra, col_rb = st.columns(2)
-    with col_ra:
-        pre_min   = st.slider("来店前の分析時間窓 (分)", 10, 60, 30, step=5)
-        osm_r     = st.slider("道路取得範囲 (m)", 300, 2000, 800, step=100,
-                               key="osm_road_r",
-                               help="OSM から取得する道路ネットワークの範囲")
-    with col_rb:
-        route_thr = st.slider("表示閾値（訪問者の %）", 0.5, 30.0, 5.0, step=0.5)
-        dooh_near_r = st.slider("経路沿い DOOH 抽出半径 (m)", 100, 800, 400, step=50,
-                                 help="確定経路セグメント中点からこの距離内の Liveboard DOOH を抽出")
-
-    run_route = st.button("▶ 経路分析 + DOOH 抽出実行", type="primary")
-    if run_route:
-        # OSM 道路ネットワーク取得
-        with st.spinner("OSM から道路ネットワークを取得中..."):
-            osm_segs, osm_msg = fetch_osm_roads(store_lat, store_lon, osm_r)
-        if osm_segs:
-            G, node_arr, node_kid, sp_graph = build_road_network(osm_segs)
+    # ── Plateau 道路データ取得 ──────────────────────────────────────────────
+    st.subheader("🏗️ Plateau 道路データ取得")
+    plateau_r = st.slider("道路取得範囲 (m)", 300, 2000, 800, step=100,
+                           key="plateau_road_r",
+                           help="Plateau CityGML から取得する道路ネットワークの範囲")
+    fetch_roads_btn = st.button("📥 Plateau 道路データ取得",
+                                type="secondary", key="fetch_plateau_btn")
+    if fetch_roads_btn:
+        with st.spinner("Plateau から道路データを並列取得中...（初回は数十秒）"):
+            p_segs, p_msg = fetch_plateau_roads(store_lat, store_lon, plateau_r)
+        st.info(p_msg)
+        if p_segs:
+            with st.spinner("道路ネットワーク構築中..."):
+                G, node_arr, node_kid, sp_graph = build_road_network(p_segs)
             st.session_state["plateau_road_G"]   = G
             st.session_state["plateau_road_arr"] = node_arr
             st.session_state["plateau_road_kid"] = node_kid
             st.session_state["road_sp_graph"]    = sp_graph
             st.session_state["road_route_df"]    = None
+            c1, c2 = st.columns(2)
+            c1.metric("道路ノード数", f"{len(node_kid):,}")
+            c2.metric("道路エッジ数", f"{G.number_of_edges():,}")
         else:
-            st.warning(f"道路データ取得失敗: {osm_msg} — GPS 点列経路のみ表示します。")
             st.session_state["plateau_road_G"] = None
 
+    _road_loaded = st.session_state.get("plateau_road_G") is not None
+    if _road_loaded:
+        st.success("✅ 道路ネットワーク読込済み")
+    else:
+        st.info("まず「Plateau 道路データ取得」を実行してください。")
+
+    st.divider()
+
+    # ── 経路分析パラメータ ─────────────────────────────────────────────────
+    col_ra, col_rb = st.columns(2)
+    with col_ra:
+        pre_min     = st.slider("来店前の分析時間窓 (分)", 10, 60, 30, step=5)
+    with col_rb:
+        route_thr   = st.slider("表示閾値（訪問者の %）", 0.5, 30.0, 5.0, step=0.5)
+    dooh_near_r = st.slider("経路沿い DOOH 抽出半径 (m)", 100, 800, 400, step=50,
+                             help="確定経路セグメント中点からこの距離内の Liveboard DOOH を抽出")
+
+    run_route = st.button("▶ 経路分析 + DOOH 抽出実行", type="primary",
+                          disabled=not _road_loaded)
+    if run_route:
         # GPS セグメント分析
-        with st.spinner("経路分析中..."):
+        with st.spinner("来店前経路を分析中..."):
             segs = analyze_pre_arrival_routes(
                 gps_df, store_visits_df, store_lat, store_lon,
                 pre_minutes=pre_min, threshold_pct=route_thr,
@@ -1224,11 +1445,11 @@ elif mode == "🗺️ 来店直前の経路特定":
         st.session_state["route_segs_df"] = segs
         st.session_state["route_dooh_df"] = None
 
-        # 道路ベース経路計算
-        _G      = st.session_state.get("plateau_road_G")
-        _arr    = st.session_state.get("plateau_road_arr")
-        _kid    = st.session_state.get("plateau_road_kid")
-        _sp     = st.session_state.get("road_sp_graph")
+        # 道路ベース経路計算（scipy Dijkstra）
+        _G   = st.session_state.get("plateau_road_G")
+        _arr = st.session_state.get("plateau_road_arr")
+        _kid = st.session_state.get("plateau_road_kid")
+        _sp  = st.session_state.get("road_sp_graph")
         if _G is not None and _arr is not None and _arr.shape[0] > 0 and not segs.empty:
             with st.spinner("道路ネットワーク上で最短経路を計算中..."):
                 rdf = compute_road_routes(
@@ -1238,7 +1459,8 @@ elif mode == "🗺️ 来店直前の経路特定":
                     sp_graph=_sp,
                 )
             st.session_state["road_route_df"] = rdf
-            st.info(f"{osm_msg} ／ 道路エッジ {_G.number_of_edges():,} 本")
+            st.info(f"道路エッジ {_G.number_of_edges():,} 本 ／ "
+                    f"通過エッジ {len(rdf):,} 本（閾値 {route_thr}%）")
 
         if not segs.empty:
             with st.spinner("Liveboard から経路沿い DOOH を抽出中..."):
@@ -1247,7 +1469,7 @@ elif mode == "🗺️ 来店直前の経路特定":
             st.session_state["route_dooh_df"] = _route_dooh
 
     if st.session_state["route_segs_df"] is None:
-        st.info("分析実行ボタンを押してください。")
+        st.info("「経路分析 + DOOH 抽出実行」ボタンを押してください。")
         st.stop()
 
     segs_df: pd.DataFrame = st.session_state["route_segs_df"]
@@ -1461,7 +1683,7 @@ elif mode == "🗺️ 来店直前の経路特定":
         fig_flyer.add_trace(go.Scattermapbox(
             lat=mid_lats, lon=mid_lons,
             mode="markers+text",
-            marker=dict(size=18, color="#f39c12", opacity=0.95),
+            marker=dict(size=28, color="#e74c3c", opacity=0.95),
             text=label_texts, textposition="top right",
             hovertext=hover_texts, hoverinfo="text",
             name="📌 配布推奨ポイント",
