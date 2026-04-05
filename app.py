@@ -16,38 +16,71 @@ import plotly.express as px
 import streamlit as st
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 定数: Liveboard DOOH 設置場所（東京都心部 モックデータ）
+# Liveboard 実データ取得
 # ─────────────────────────────────────────────────────────────────────────────
-DOOH_DF = pd.DataFrame([
-    # ── 銀座・丸の内エリア ────────────────────────────────────────────────────
-    {"id": "D01", "name": "銀座四丁目交差点",        "lat": 35.6714, "lon": 139.7651},
-    {"id": "D02", "name": "有楽町マリオン前",         "lat": 35.6753, "lon": 139.7620},
-    {"id": "D03", "name": "銀座一丁目駅前",           "lat": 35.6731, "lon": 139.7666},
-    {"id": "D04", "name": "東銀座駅前",               "lat": 35.6680, "lon": 139.7659},
-    {"id": "D05", "name": "日比谷公園前",             "lat": 35.6737, "lon": 139.7585},
-    {"id": "D06", "name": "新橋駅 SL広場",            "lat": 35.6659, "lon": 139.7575},
-    {"id": "D07", "name": "東京駅丸の内南口",         "lat": 35.6790, "lon": 139.7660},
-    {"id": "D08", "name": "虎ノ門ヒルズ前",           "lat": 35.6673, "lon": 139.7490},
-    # ── 新宿エリア ────────────────────────────────────────────────────────────
-    {"id": "D21", "name": "新宿駅南口",               "lat": 35.6877, "lon": 139.7033},
-    {"id": "D22", "name": "新宿駅東口",               "lat": 35.6905, "lon": 139.7013},
-    {"id": "D23", "name": "新宿駅西口",               "lat": 35.6896, "lon": 139.6993},
-    {"id": "D24", "name": "新宿三丁目交差点",         "lat": 35.6887, "lon": 139.7053},
-    {"id": "D25", "name": "新宿タイムズスクエア前",   "lat": 35.6884, "lon": 139.7023},
-    {"id": "D26", "name": "甲州街道 新宿",            "lat": 35.6875, "lon": 139.7015},
-    {"id": "D27", "name": "新宿四丁目",               "lat": 35.6854, "lon": 139.7063},
-    {"id": "D28", "name": "代々木駅前",               "lat": 35.6826, "lon": 139.7023},
-    {"id": "D29", "name": "新宿御苑前",               "lat": 35.6868, "lon": 139.7101},
-    {"id": "D30", "name": "新宿歌舞伎町",             "lat": 35.6938, "lon": 139.7016},
-    {"id": "D31", "name": "新宿モード学園前",         "lat": 35.6918, "lon": 139.6980},
-    {"id": "D32", "name": "新宿サザンテラス",         "lat": 35.6879, "lon": 139.7006},
-    # ── その他主要エリア ─────────────────────────────────────────────────────
-    {"id": "D41", "name": "渋谷スクランブル交差点",   "lat": 35.6595, "lon": 139.7005},
-    {"id": "D42", "name": "池袋東口",                 "lat": 35.7295, "lon": 139.7109},
-    {"id": "D43", "name": "六本木ヒルズ前",           "lat": 35.6601, "lon": 139.7292},
-    {"id": "D44", "name": "原宿駅前",                 "lat": 35.6702, "lon": 139.7026},
-    {"id": "D45", "name": "上野公園前",               "lat": 35.7141, "lon": 139.7774},
-])
+import re
+
+_LIVEBOARD_URL = "https://liveboard.co.jp/screen/tokyo/area.html?local=all"
+_SCREEN_TYPE_MAP = {"1": "屋外", "2": "交通", "3": "商業施設", "4": "その他"}
+_OWNERSHIP_MAP   = {"1": "LIVE BOARD 直営", "2": "パートナー"}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_dooh_df() -> pd.DataFrame:
+    """Liveboard 東京 DOOH 設置場所を取得して DataFrame を返す（1時間キャッシュ）。
+    取得失敗時はフォールバックの主要地点を返す。"""
+    try:
+        req = urllib.request.Request(
+            _LIVEBOARD_URL,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; research-bot/1.0)"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as r:
+            html = r.read().decode("utf-8", errors="replace")
+
+        m = re.search(r"DETAIL_DATA\s*=\s*\[", html)
+        if not m:
+            raise ValueError("DETAIL_DATA not found")
+
+        start = m.end() - 1
+        depth = 0
+        end = start
+        for i, ch in enumerate(html[start:], start):
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+
+        data = json.loads(html[start:end])
+        rows = []
+        for d in data:
+            lat = float(d.get("lat", 0) or 0)
+            lng = float(d.get("lng", 0) or 0)
+            if lat == 0 or lng == 0:
+                continue
+            rows.append({
+                "id":          d.get("uid", ""),
+                "name":        d.get("title", ""),
+                "station":     d.get("station", ""),
+                "lat":         lat,
+                "lon":         lng,
+                "screen_type": _SCREEN_TYPE_MAP.get(d.get("screenType", ""), "不明"),
+                "ownership":   _OWNERSHIP_MAP.get(d.get("ownership", ""), "不明"),
+                "url":         "https://liveboard.co.jp" + d.get("permalink", ""),
+            })
+        return pd.DataFrame(rows)
+    except Exception:
+        # フォールバック: 主要地点
+        return pd.DataFrame([
+            {"id": "F01", "name": "新宿三丁目駅前",    "station": "新宿三丁目", "lat": 35.691012, "lon": 139.704566, "screen_type": "交通", "ownership": "不明", "url": ""},
+            {"id": "F02", "name": "渋谷フクラスビジョン", "station": "渋谷",      "lat": 35.657965, "lon": 139.700307, "screen_type": "交通", "ownership": "不明", "url": ""},
+            {"id": "F03", "name": "東京駅メトロビジョン", "station": "東京",      "lat": 35.682020, "lon": 139.764845, "screen_type": "交通", "ownership": "不明", "url": ""},
+        ])
+
+
+DOOH_DF = load_dooh_df()
 
 REQUIRED_COLS = {"member_id", "lat", "lon", "stay_datetime", "stay_duration_min"}
 
@@ -651,6 +684,7 @@ mode = st.radio(
 if mode == "📺 DOOH 訴求推薦":
     st.divider()
     st.header("④ DOOH 訴求推薦")
+    st.caption(f"📺 DOOH 設置場所データ: **Liveboard 東京** より取得（{len(DOOH_DF)} 箇所・実データ）")
 
     st.subheader("分析対象ホテルを選択")
     all_hotel_names = hotel_stats["hotel_name"].tolist()
