@@ -80,7 +80,24 @@ def load_dooh_df() -> pd.DataFrame:
         ])
 
 
-DOOH_DF = load_dooh_df()
+def extract_dooh_near_routes(segs_df: pd.DataFrame,
+                              all_dooh_df: pd.DataFrame,
+                              radius_m: float = 400) -> pd.DataFrame:
+    """確定した移動経路セグメントの近傍にある DOOH 設置場所のみを返す。
+    各セグメントの中点から radius_m 以内の設置場所に絞り込む。"""
+    if segs_df.empty or all_dooh_df.empty:
+        return all_dooh_df
+
+    nearby_ids: set = set()
+    for _, seg in segs_df.iterrows():
+        mid_lat = (seg.lat1 + seg.lat2) / 2
+        mid_lon = (seg.lon1 + seg.lon2) / 2
+        for _, dooh in all_dooh_df.iterrows():
+            if haversine_m(mid_lat, mid_lon, dooh.lat, dooh.lon) <= radius_m:
+                nearby_ids.add(dooh["id"])
+
+    return all_dooh_df[all_dooh_df["id"].isin(nearby_ids)].reset_index(drop=True)
+
 
 REQUIRED_COLS = {"member_id", "lat", "lon", "stay_datetime", "stay_duration_min"}
 
@@ -477,7 +494,7 @@ for k, v in [
     ("store_visitors", None), ("store_visits_df", None),
     ("prev_night_df", None), ("analysis_mode", None),
     ("dooh_passages_df", None), ("dooh_n_sel", 0),
-    ("route_segs_df", None),
+    ("route_segs_df", None), ("route_dooh_df", None),
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -517,7 +534,7 @@ with col_up:
             st.session_state.update({
                 "gps_df": df_tmp, "hotels_df": None,
                 "prev_night_df": None, "store_visitors": None,
-                "dooh_passages_df": None, "route_segs_df": None,
+                "dooh_passages_df": None, "route_segs_df": None, "route_dooh_df": None,
             })
             st.success(f"✅ {len(df_tmp):,} レコード / {df_tmp['member_id'].nunique():,} メンバー")
 
@@ -684,7 +701,7 @@ mode = st.radio(
 if mode == "📺 DOOH 訴求推薦":
     st.divider()
     st.header("④ DOOH 訴求推薦")
-    st.caption(f"📺 DOOH 設置場所データ: **Liveboard 東京** より取得（{len(DOOH_DF)} 箇所・実データ）")
+    st.caption("📺 DOOH 設置場所データ: **Liveboard 東京** より分析実行時に取得（実データ）")
 
     st.subheader("分析対象ホテルを選択")
     all_hotel_names = hotel_stats["hotel_name"].tolist()
@@ -707,14 +724,17 @@ if mode == "📺 DOOH 訴求推薦":
                    if sel_hotels else None)
         n_sel = (prev_night_df[prev_night_df["hotel_id"].isin(sel_ids)]["member_id"].nunique()
                  if sel_ids else prev_night_df["member_id"].nunique())
+        with st.spinner("Liveboard DOOH データ取得中..."):
+            _all_dooh = load_dooh_df()
         with st.spinner("DOOH 通過分析中..."):
             passages = compute_dooh_passages(
-                gps_df, prev_night_df, DOOH_DF,
+                gps_df, prev_night_df, _all_dooh,
                 selected_hotel_ids=sel_ids,
                 passage_r_m=dooh_r,
             )
         st.session_state["dooh_passages_df"] = passages
         st.session_state["dooh_n_sel"] = n_sel
+        st.session_state["_dooh_total"] = len(_all_dooh)
 
     if st.session_state["dooh_passages_df"] is None:
         st.info("分析実行ボタンを押してください。")
@@ -740,8 +760,9 @@ if mode == "📺 DOOH 訴求推薦":
                   .sort_values("pct", ascending=False)
                   .reset_index(drop=True))
 
+    _dooh_total = st.session_state.get("_dooh_total", "?")
     st.metric(f"閾値 {dooh_thr}% 超の DOOH 設置場所",
-              f"{len(qualifying)} 箇所 / {len(DOOH_DF)} 箇所")
+              f"{len(qualifying)} 箇所 / {_dooh_total} 箇所")
 
     if qualifying.empty:
         st.warning("閾値を超える DOOH 設置場所がありません。閾値を下げてください。")
@@ -825,7 +846,10 @@ elif mode == "🗺️ 来店直前の経路特定":
     with col_rb:
         route_thr = st.slider("表示閾値（訪問者の %）", 0.5, 30.0, 5.0, step=0.5)
 
-    run_route = st.button("▶ 経路分析実行", type="primary")
+    dooh_near_r = st.slider("経路沿い DOOH 抽出半径 (m)", 100, 800, 400, step=50,
+                             help="確定した経路セグメントの中点からこの距離内の Liveboard DOOH のみを抽出します")
+
+    run_route = st.button("▶ 経路分析 + DOOH 抽出実行", type="primary")
     if run_route:
         with st.spinner("経路分析中..."):
             segs = analyze_pre_arrival_routes(
@@ -833,6 +857,12 @@ elif mode == "🗺️ 来店直前の経路特定":
                 pre_minutes=pre_min, threshold_pct=route_thr,
             )
         st.session_state["route_segs_df"] = segs
+        st.session_state["route_dooh_df"] = None  # 経路変更時はリセット
+        if not segs.empty:
+            with st.spinner("Liveboard から経路沿い DOOH を抽出中..."):
+                _all_dooh = load_dooh_df()
+                _route_dooh = extract_dooh_near_routes(segs, _all_dooh, radius_m=dooh_near_r)
+            st.session_state["route_dooh_df"] = _route_dooh
 
     if st.session_state["route_segs_df"] is None:
         st.info("分析実行ボタンを押してください。")
@@ -901,7 +931,69 @@ elif mode == "🗺️ 来店直前の経路特定":
     )
     st.plotly_chart(fig_rt, use_container_width=True)
 
+    # ── 経路沿い DOOH 抽出結果 ────────────────────────────────────────────────
+    route_dooh_df: pd.DataFrame = st.session_state.get("route_dooh_df")
+    if route_dooh_df is not None and not route_dooh_df.empty:
+        st.divider()
+        st.subheader("📺 経路沿い DOOH 設置場所（Liveboard 実データ・動的抽出）")
+        _all_dooh = load_dooh_df()
+        st.caption(
+            f"確定した移動経路セグメント近傍の DOOH を自動抽出: "
+            f"**{len(route_dooh_df)} 箇所** / 東京全体 {len(_all_dooh)} 箇所"
+        )
+
+        # 経路 + 抽出 DOOH の複合マップ
+        fig_dooh_rt = go.Figure()
+        # 経路セグメント（店舗方向のみ）
+        approach_segs = segs_df[segs_df["approaching"]]
+        max_cnt = segs_df["count"].max() or 1
+        for _, seg in approach_segs.iterrows():
+            w = max(1.5, min(8, seg["count"] / max_cnt * 8))
+            fig_dooh_rt.add_trace(go.Scattermapbox(
+                lat=[seg.lat1, seg.lat2], lon=[seg.lon1, seg.lon2],
+                mode="lines", line=dict(color="rgba(230,126,34,0.65)", width=w),
+                hoverinfo="skip", showlegend=False,
+            ))
+        # 抽出した DOOH 設置場所
+        fig_dooh_rt.add_trace(go.Scattermapbox(
+            lat=route_dooh_df["lat"], lon=route_dooh_df["lon"],
+            mode="markers+text",
+            marker=dict(size=14, color="#8e44ad", opacity=0.9),
+            text=route_dooh_df["name"], textposition="top right",
+            customdata=route_dooh_df[["station", "screen_type", "ownership"]].values,
+            hovertemplate=(
+                "<b>%{text}</b><br>"
+                "最寄駅: %{customdata[0]}<br>"
+                "種別: %{customdata[1]} ｜ %{customdata[2]}"
+                "<extra></extra>"
+            ),
+            name="📺 経路沿い DOOH",
+        ))
+        # 百貨店
+        fig_dooh_rt.add_trace(go.Scattermapbox(
+            lat=[store_lat], lon=[store_lon], mode="markers+text",
+            marker=dict(size=20, color="#e74c3c", symbol="star"),
+            text=[store_name], textposition="top right", name=store_name,
+        ))
+        fig_dooh_rt.update_layout(
+            mapbox=dict(style="open-street-map",
+                        center=dict(lat=store_lat, lon=store_lon), zoom=15),
+            height=520, margin=dict(r=0, t=0, l=0, b=0),
+            legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01,
+                        bgcolor="rgba(255,255,255,0.9)"),
+        )
+        st.plotly_chart(fig_dooh_rt, use_container_width=True)
+
+        # 抽出 DOOH 一覧テーブル
+        with st.expander(f"抽出 DOOH 一覧（{len(route_dooh_df)} 箇所）"):
+            disp = route_dooh_df[["name", "station", "screen_type", "ownership", "url"]].copy()
+            disp.columns = ["名称", "最寄駅", "種別", "運営", "詳細URL"]
+            st.dataframe(disp, use_container_width=True, hide_index=True)
+    elif route_dooh_df is not None and route_dooh_df.empty:
+        st.info("確定した経路の近傍に Liveboard DOOH 設置場所が見つかりませんでした。抽出半径を広げてください。")
+
     # ── 配布推奨ポイント ──────────────────────────────────────────────────────
+    st.divider()
     st.subheader("💡 チラシ・ポスター配布 推奨ポイント（店舗方向通行 上位 5 箇所）")
     top5 = segs_df[segs_df["approaching"]].head(5)
     if top5.empty:
