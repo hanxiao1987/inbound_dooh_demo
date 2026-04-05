@@ -8,6 +8,10 @@ import urllib.request
 import urllib.parse
 from datetime import datetime, timedelta
 from typing import Optional
+import struct
+import zlib
+import io as _io
+import xml.etree.ElementTree as _ET
 
 import numpy as np
 import pandas as pd
@@ -78,6 +82,358 @@ def load_dooh_df() -> pd.DataFrame:
             {"id": "F02", "name": "渋谷フクラスビジョン", "station": "渋谷",      "lat": 35.657965, "lon": 139.700307, "screen_type": "交通", "ownership": "不明", "url": ""},
             {"id": "F03", "name": "東京駅メトロビジョン", "station": "東京",      "lat": 35.682020, "lon": 139.764845, "screen_type": "交通", "ownership": "不明", "url": ""},
         ])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plateau 道路ネットワーク取得・構築
+# ─────────────────────────────────────────────────────────────────────────────
+_GML_NS  = "http://www.opengis.net/gml"
+_TRAN_NS = "http://www.opengis.net/citygml/transportation/2.0"
+_TRAN_NS1= "http://www.opengis.net/citygml/transportation/1.0"
+_CORE_NS = "http://www.opengis.net/citygml/2.0"
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def _fetch_plateau_catalog_road() -> dict:
+    catalog = {}
+    rows_per_page, start = 100, 0
+    while True:
+        url = (f"https://www.geospatial.jp/ckan/api/3/action/package_search"
+               f"?fq=tags:PLATEAU&rows={rows_per_page}&start={start}")
+        with urllib.request.urlopen(url, timeout=20) as r:
+            data = json.loads(r.read())
+        results = data["result"]["results"]
+        total   = data["result"]["count"]
+        for item in results:
+            name = item.get("name", "")
+            m = re.match(r"^plateau-(\d{5})-.*-(\d{4})$", name)
+            if m:
+                muni_cd = m.group(1); year = int(m.group(2))
+                if not catalog.get(muni_cd) or int(catalog[muni_cd].split("-")[-1]) < year:
+                    catalog[muni_cd] = name
+        start += rows_per_page
+        if start >= total:
+            break
+    return catalog
+
+
+def _gsi_muni_code(lat: float, lon: float) -> Optional[str]:
+    url = (f"https://mreversegeocoder.gsi.go.jp/reverse-geocoder/"
+           f"LonLatToAddress?lat={lat}&lon={lon}")
+    try:
+        with urllib.request.urlopen(url, timeout=10) as r:
+            return json.loads(r.read())["results"]["muniCd"]
+    except Exception:
+        return None
+
+
+def _plateau_zip_url(dataset_id: str) -> Optional[str]:
+    url = f"https://www.geospatial.jp/ckan/api/3/action/package_show?id={dataset_id}"
+    try:
+        with urllib.request.urlopen(url, timeout=15) as r:
+            data = json.loads(r.read())
+        resources = data["result"]["resources"]
+        v3_url = fallback_url = None
+        for res in resources:
+            name = res.get("name", ""); rurl = res.get("url", "")
+            if "CityGML" in name and rurl.endswith(".zip"):
+                if "v3" in name or "v3" in rurl:
+                    v3_url = rurl
+                elif fallback_url is None:
+                    fallback_url = rurl
+        return v3_url or fallback_url
+    except Exception:
+        return None
+
+
+def _zip_cd_for_layer(zip_url: str, layer: str) -> dict:
+    """ZIP セントラルディレクトリから layer(例:'tran')の GML エントリを抽出"""
+    req = urllib.request.Request(zip_url, headers={"Range": "bytes=-65536"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        tail = r.read()
+    sig = b"PK\x05\x06"
+    pos = tail.rfind(sig)
+    if pos == -1:
+        raise ValueError("ZIP EOCD not found")
+    eocd = tail[pos:]
+    cd_size   = struct.unpack_from("<I", eocd, 12)[0]
+    cd_offset = struct.unpack_from("<I", eocd, 16)[0]
+    req2 = urllib.request.Request(
+        zip_url, headers={"Range": f"bytes={cd_offset}-{cd_offset+cd_size-1}"})
+    with urllib.request.urlopen(req2, timeout=30) as r:
+        cd_data = r.read()
+    files = {}
+    offset = 0
+    while offset + 46 <= len(cd_data):
+        if cd_data[offset:offset+4] != b"PK\x01\x02":
+            break
+        method      = struct.unpack_from("<H", cd_data, offset+10)[0]
+        comp_size   = struct.unpack_from("<I", cd_data, offset+20)[0]
+        fname_len   = struct.unpack_from("<H", cd_data, offset+28)[0]
+        extra_len   = struct.unpack_from("<H", cd_data, offset+30)[0]
+        comment_len = struct.unpack_from("<H", cd_data, offset+32)[0]
+        local_off   = struct.unpack_from("<I", cd_data, offset+42)[0]
+        fname = cd_data[offset+46:offset+46+fname_len].decode("utf-8", errors="replace")
+        if layer in fname and fname.endswith(".gml"):
+            files[fname.split("/")[-1]] = (local_off, comp_size, method)
+        offset += 46 + fname_len + extra_len + comment_len
+    return files
+
+
+def _extract_gml(zip_url: str, local_off: int, comp_size: int, method: int) -> bytes:
+    lh_req = urllib.request.Request(
+        zip_url, headers={"Range": f"bytes={local_off}-{local_off+29}"})
+    with urllib.request.urlopen(lh_req, timeout=30) as r:
+        lh = r.read()
+    lh_fname_len = struct.unpack_from("<H", lh, 26)[0]
+    lh_extra_len = struct.unpack_from("<H", lh, 28)[0]
+    data_start = local_off + 30 + lh_fname_len + lh_extra_len
+    data_req = urllib.request.Request(
+        zip_url, headers={"Range": f"bytes={data_start}-{data_start+comp_size-1}"})
+    with urllib.request.urlopen(data_req, timeout=120) as r:
+        comp = r.read()
+    return zlib.decompress(comp, -15) if method == 8 else comp
+
+
+def _encode_mesh3(lat: float, lon: float) -> str:
+    """3 次メッシュコード（8 桁）を返す"""
+    p = int(lat * 1.5)
+    u = int(lon) - 100
+    lat2 = lat * 1.5 - p
+    lon2 = lon - int(lon)
+    q = int(lat2 * 8)
+    v = int(lon2 * 8)
+    lat3 = lat2 * 8 - q
+    lon3 = lon2 * 8 - v
+    r = int(lat3 * 10)
+    w = int(lon3 * 10)
+    return f"{p:02d}{u:02d}{q}{v}{r}{w}"
+
+
+def parse_citygml_roads(gml_bytes: bytes) -> list:
+    """tran CityGML から道路中心線 (lon,lat) 点列リストを返す"""
+    try:
+        root = _ET.fromstring(gml_bytes)
+    except Exception:
+        return []
+
+    # srsDimension 検出
+    dim = 3
+    for el in root.iter():
+        sd = el.get(f"{{{_GML_NS}}}srsDimension") or el.get("srsDimension")
+        if sd:
+            dim = int(sd); break
+
+    # 座標軸順: JGD2011(6697/6668/4612) は lat,lon → swap 必要
+    srs = ""
+    for el in root.iter():
+        s = el.get("srsName") or ""
+        if s: srs = s; break
+    swap = not ("4326" in srs or "WGS" in srs.upper())
+
+    # tran namespace
+    tran = _TRAN_NS if root.find(f".//{{{_TRAN_NS}}}Road") is not None else _TRAN_NS1
+
+    result = []
+    for road in root.findall(f".//{{{tran}}}Road"):
+        for pos_el in road.iter(f"{{{_GML_NS}}}posList"):
+            text = (pos_el.text or "").strip()
+            if not text:
+                continue
+            vals = [float(v) for v in text.split()]
+            pts = []
+            for i in range(0, len(vals) - dim + 1, dim):
+                if swap:
+                    pts.append((vals[i+1], vals[i]))   # lon, lat
+                else:
+                    pts.append((vals[i], vals[i+1]))   # lon, lat
+            if len(pts) >= 2:
+                result.append(pts)
+    return result
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_plateau_roads(center_lat: float, center_lon: float,
+                         radius_m: float) -> tuple:
+    """
+    指定範囲の Plateau 道路中心線を取得し (road_segments, status_msg) を返す。
+    road_segments: list of [(lon,lat), ...]
+    """
+    try:
+        import networkx as nx
+        from scipy.spatial import KDTree
+    except ImportError:
+        return [], "❌ networkx / scipy が未インストールです"
+
+    lat_sc = 111320.0
+    lon_sc = 111320.0 * math.cos(math.radians(center_lat))
+    dlat = radius_m / lat_sc * 1.2
+    dlon = radius_m / lon_sc * 1.2
+
+    # メッシュコード収集
+    mesh_sz_lat = (2.0/3.0) / 80
+    mesh_sz_lon = 1.0 / 80
+    prefixes = set()
+    la = math.floor((center_lat - dlat) / mesh_sz_lat) * mesh_sz_lat
+    while la <= center_lat + dlat + mesh_sz_lat:
+        lo = math.floor((center_lon - dlon) / mesh_sz_lon) * mesh_sz_lon
+        while lo <= center_lon + dlon + mesh_sz_lon:
+            prefixes.add(_encode_mesh3(la + mesh_sz_lat/2, lo + mesh_sz_lon/2)[:8])
+            lo += mesh_sz_lon
+        la += mesh_sz_lat
+
+    # カタログ・ZIPurl 取得
+    catalog = _fetch_plateau_catalog_road()
+    muni_cd = _gsi_muni_code(center_lat, center_lon)
+    if not muni_cd:
+        return [], "❌ 市区町村コード取得失敗"
+    dataset_id = catalog.get(muni_cd)
+    if not dataset_id:
+        return [], f"⚠️ {muni_cd} の Plateau データなし"
+    zip_url = _plateau_zip_url(dataset_id)
+    if not zip_url:
+        return [], "⚠️ ZIP URL 取得失敗"
+
+    # tran GML 一覧
+    cd = _zip_cd_for_layer(zip_url, "tran")
+    needed = {f: info for f, info in cd.items()
+              if any(f.startswith(p) for p in prefixes)}
+    if not needed:
+        return [], "⚠️ 対象エリアの道路 GML なし"
+
+    all_segs = []
+    for fname, (off, comp_sz, method) in needed.items():
+        try:
+            gml = _extract_gml(zip_url, off, comp_sz, method)
+            segs = parse_citygml_roads(gml)
+            all_segs.extend(segs)
+        except Exception:
+            pass
+
+    return all_segs, f"✅ 道路セグメント {len(all_segs):,} 本取得"
+
+
+def build_road_network(road_segments: list):
+    """
+    道路セグメント [(lon,lat),...] リストから networkx グラフを構築。
+    Returns (G, node_arr, node_key_to_id)
+    """
+    import networkx as nx
+
+    G = nx.Graph()
+    node_key_to_id: dict = {}
+    node_coords: list = []
+
+    def get_nid(lon, lat):
+        key = (round(lon, 5), round(lat, 5))
+        if key not in node_key_to_id:
+            nid = len(node_key_to_id)
+            node_key_to_id[key] = nid
+            G.add_node(nid, lon=lon, lat=lat)
+            node_coords.append([lon, lat])
+        return node_key_to_id[key]
+
+    for seg in road_segments:
+        prev = None
+        for lon, lat in seg:
+            nid = get_nid(lon, lat)
+            if prev is not None and prev != nid:
+                pdata = G.nodes[prev]; ndata = G.nodes[nid]
+                dist = haversine_m(pdata["lat"], pdata["lon"],
+                                   ndata["lat"], ndata["lon"])
+                if dist > 0 and not G.has_edge(prev, nid):
+                    G.add_edge(prev, nid, weight=dist)
+            prev = nid
+
+    node_arr = np.array(node_coords) if node_coords else np.empty((0, 2))
+    return G, node_arr, node_key_to_id
+
+
+def compute_road_routes(gps_df: pd.DataFrame,
+                         store_visits_df: pd.DataFrame,
+                         G, node_arr, node_key_to_id: dict,
+                         store_lat: float, store_lon: float,
+                         pre_minutes: int = 30,
+                         threshold_pct: float = 5.0) -> pd.DataFrame:
+    """
+    GPS 滞留点を道路ネットワークにスナップして最短経路を計算。
+    道路エッジごとの通過者数を集計して返す。
+    Returns: DataFrame [lon1,lat1,lon2,lat2,count,pct,approaching]
+    """
+    import networkx as nx
+    from scipy.spatial import KDTree
+
+    if store_visits_df.empty or node_arr.shape[0] == 0:
+        return pd.DataFrame()
+
+    n_visitors = store_visits_df["member_id"].nunique()
+    tree = KDTree(node_arr)
+    id_to_key = {v: k for k, v in node_key_to_id.items()}
+
+    def snap(lon, lat):
+        _, idx = tree.query([lon, lat])
+        return int(idx)
+
+    edge_members: dict = {}  # (n1,n2) → set of member_ids
+
+    for _, visit in store_visits_df.iterrows():
+        t0 = visit.arrival_time - timedelta(minutes=pre_minutes)
+        sub = (gps_df[
+            (gps_df["member_id"] == visit.member_id) &
+            (gps_df["stay_datetime"] >= t0) &
+            (gps_df["stay_datetime"] <= visit.arrival_time)
+        ].sort_values("stay_datetime").reset_index(drop=True))
+
+        if len(sub) < 2:
+            continue
+
+        pts = [(row.lon, row.lat) for _, row in sub.iterrows()]
+        for i in range(len(pts) - 1):
+            n1 = snap(*pts[i])
+            n2 = snap(*pts[i+1])
+            if n1 == n2:
+                continue
+            try:
+                path = nx.shortest_path(G, n1, n2, weight="weight")
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                path = [n1, n2]
+            for j in range(len(path) - 1):
+                key = tuple(sorted([path[j], path[j+1]]))
+                edge_members.setdefault(key, set()).add(visit.member_id)
+
+    if not edge_members:
+        return pd.DataFrame()
+
+    rows = []
+    threshold = max(1, n_visitors * threshold_pct / 100.0)
+    for (n1, n2), members in edge_members.items():
+        if len(members) < threshold:
+            continue
+        k1, k2 = id_to_key.get(n1), id_to_key.get(n2)
+        if k1 is None or k2 is None:
+            continue
+        lon1, lat1 = k1
+        lon2, lat2 = k2
+        mid_lat = (lat1 + lat2) / 2
+        mid_lon = (lon1 + lon2) / 2
+        brg = bearing_deg(lat1, lon1, lat2, lon2)
+        brg_store = bearing_deg(mid_lat, mid_lon, store_lat, store_lon)
+        diff = abs(brg - brg_store)
+        if diff > 180:
+            diff = 360 - diff
+        rows.append({
+            "lon1": lon1, "lat1": lat1,
+            "lon2": lon2, "lat2": lat2,
+            "count": len(members),
+            "pct":   len(members) / n_visitors * 100,
+            "approaching": diff < 90,
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows).sort_values("count", ascending=False).reset_index(drop=True)
+    return df
 
 
 def extract_dooh_near_routes(segs_df: pd.DataFrame,
@@ -543,6 +899,9 @@ for k, v in [
     ("dooh_passages_df", None), ("dooh_n_sel", 0),
     ("route_segs_df", None), ("route_dooh_df", None),
     ("_gps_file_key", None),
+    ("plateau_road_segs", None), ("plateau_road_G", None),
+    ("plateau_road_arr", None), ("plateau_road_kid", None),
+    ("road_route_df", None),
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -587,8 +946,25 @@ with col_up:
                     "prev_night_df": None, "store_visitors": None,
                     "dooh_passages_df": None, "route_segs_df": None, "route_dooh_df": None,
                     "_gps_file_key": _fkey,
+                    "plateau_road_segs": None, "plateau_road_G": None,
+                    "plateau_road_arr": None, "plateau_road_kid": None,
+                    "road_route_df": None,
                 })
                 st.success(f"✅ {len(df_tmp):,} レコード / {df_tmp['member_id'].nunique():,} メンバー")
+
+# 百貨店位置プレビュー
+st.subheader("📍 百貨店位置確認")
+fig_loc = go.Figure(go.Scattermapbox(
+    lat=[store_lat], lon=[store_lon], mode="markers+text",
+    marker=dict(size=18, color="#e74c3c", symbol="star"),
+    text=[store_name], textposition="top right",
+))
+fig_loc.update_layout(
+    mapbox=dict(style="open-street-map",
+                center=dict(lat=store_lat, lon=store_lon), zoom=15),
+    height=300, margin=dict(r=0, t=0, l=0, b=0),
+)
+st.plotly_chart(fig_loc, use_container_width=True)
 
 if st.session_state["gps_df"] is None:
     st.info("GPS データ CSV をアップロードしてください。")
@@ -607,6 +983,28 @@ m1, m2, m3 = st.columns(3)
 m1.metric("GPS レコード総数",       f"{len(gps_df):,}")
 m2.metric("ユニークメンバー数",     f"{gps_df['member_id'].nunique():,}")
 m3.metric(f"{store_name} 訪問者数", f"{len(store_visitors):,}")
+
+# GPS 滞留点ヒートマップ
+with st.expander("🔥 GPS 滞留点ヒートマップ", expanded=True):
+    fig_heat = go.Figure(go.Densitymapbox(
+        lat=gps_df["lat"], lon=gps_df["lon"],
+        z=gps_df["stay_duration_min"],
+        radius=15, opacity=0.7,
+        colorscale="YlOrRd",
+        hovertemplate="緯度: %{lat:.5f}<br>経度: %{lon:.5f}<extra></extra>",
+    ))
+    fig_heat.add_trace(go.Scattermapbox(
+        lat=[store_lat], lon=[store_lon], mode="markers+text",
+        marker=dict(size=16, color="#2980b9", symbol="star"),
+        text=[store_name], textposition="top right", name=store_name,
+    ))
+    fig_heat.update_layout(
+        mapbox=dict(style="open-street-map",
+                    center=dict(lat=gps_df["lat"].mean(),
+                                lon=gps_df["lon"].mean()), zoom=13),
+        height=420, margin=dict(r=0, t=0, l=0, b=0),
+    )
+    st.plotly_chart(fig_heat, use_container_width=True)
 
 if not store_visitors:
     st.warning("百貨店訪問者が検出されませんでした。中心点・半径を調整してください。")
@@ -870,8 +1268,10 @@ if mode == "📺 DOOH 訴求推薦":
 
     # ── サンキーダイアグラム ────────────────────────────────────────────────────
     st.subheader("🔀 サンキーダイアグラム（ホテル → DOOH 通過 → 百貨店）")
+    _sankey_pn = (prev_night_df[prev_night_df["hotel_id"].isin(sel_ids)]
+                  if sel_ids else prev_night_df)
     sankey_fig = build_sankey(
-        passages_df, prev_night_df,
+        passages_df, _sankey_pn,
         store_name, len(store_visitors), dooh_thr,
     )
     if sankey_fig:
@@ -891,6 +1291,25 @@ elif mode == "🗺️ 来店直前の経路特定":
         "※ 本デモでは GPS 滞在点の時系列連結による簡易経路近似を使用しています。"
         "Plateau 道路データへのマップマッチングは別途実装可能です。"
     )
+
+    # ── Plateau 道路ネットワーク取得 ──────────────────────────────────────────
+    st.subheader("🗺️ Plateau 道路データ取得")
+    plateau_r = st.slider("道路取得範囲 (m)", 300, 2000, 800, step=100,
+                           key="plateau_road_r")
+    fetch_roads_btn = st.button("🏗️ Plateau 道路データ取得", type="secondary")
+    if fetch_roads_btn:
+        with st.spinner("Plateau から道路データを取得中（初回は数十秒かかります）..."):
+            segs, msg = fetch_plateau_roads(store_lat, store_lon, plateau_r)
+        st.info(msg)
+        if segs:
+            G, node_arr, node_kid = build_road_network(segs)
+            st.session_state["plateau_road_segs"] = segs
+            st.session_state["plateau_road_G"]    = G
+            st.session_state["plateau_road_arr"]  = node_arr
+            st.session_state["plateau_road_kid"]  = node_kid
+            st.session_state["road_route_df"]     = None
+            st.metric("道路ノード数", f"{len(node_kid):,}")
+            st.metric("道路エッジ数", f"{G.number_of_edges():,}")
 
     col_ra, col_rb = st.columns(2)
     with col_ra:
@@ -1138,3 +1557,61 @@ elif mode == "🗺️ 来店直前の経路特定":
             show = show.rename(columns={"dominant_speed": "支配速度"})
             cols += ["低速","中速","高速","支配速度"]
         st.dataframe(show[cols], use_container_width=True, hide_index=True)
+
+    # ── Plateau 道路ベース経路 ────────────────────────────────────────────────
+    _G   = st.session_state.get("plateau_road_G")
+    _arr = st.session_state.get("plateau_road_arr")
+    _kid = st.session_state.get("plateau_road_kid")
+
+    if _G is not None and _arr is not None and _arr.shape[0] > 0:
+        st.divider()
+        st.subheader("🛣️ Plateau 道路ベース 推定経路")
+        run_road = st.button("▶ 道路ベース経路を計算", type="primary",
+                             key="run_road_route")
+        if run_road:
+            with st.spinner("道路ネットワーク上で最短経路を計算中..."):
+                rdf = compute_road_routes(
+                    gps_df, store_visits_df, _G, _arr, _kid,
+                    store_lat, store_lon,
+                    pre_minutes=pre_min, threshold_pct=route_thr,
+                )
+            st.session_state["road_route_df"] = rdf
+
+        rdf: pd.DataFrame = st.session_state.get("road_route_df")
+        if rdf is not None and not rdf.empty:
+            app_r = rdf[rdf["approaching"]]
+            st.caption(
+                f"店舗方向エッジ: {len(app_r)} 本 ／ "
+                f"全エッジ: {len(rdf)} 本（閾値 {route_thr}% 以上）"
+            )
+            fig_road = go.Figure()
+            max_c = rdf["count"].max() or 1
+            for _, row in rdf.iterrows():
+                color = ("rgba(39,174,96,0.85)" if row["approaching"]
+                         else "rgba(52,152,219,0.50)")
+                w = max(1.5, min(10, row["count"] / max_c * 10))
+                fig_road.add_trace(go.Scattermapbox(
+                    lat=[row.lat1, row.lat2], lon=[row.lon1, row.lon2],
+                    mode="lines", line=dict(color=color, width=w),
+                    hovertemplate=(
+                        f"{'→ 店舗方向' if row['approaching'] else '← 逆方向'}"
+                        f"<br>{row['count']} 人 ({row['pct']:.1f}%)<extra></extra>"
+                    ),
+                    showlegend=False,
+                ))
+            fig_road.add_trace(go.Scattermapbox(
+                lat=[store_lat], lon=[store_lon], mode="markers+text",
+                marker=dict(size=20, color="#e74c3c", symbol="star"),
+                text=[store_name], textposition="top right", name=store_name,
+            ))
+            fig_road.update_layout(
+                mapbox=dict(style="open-street-map",
+                            center=dict(lat=store_lat, lon=store_lon), zoom=16),
+                height=560, margin=dict(r=0, t=0, l=0, b=0),
+                legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01,
+                            bgcolor="rgba(255,255,255,0.9)"),
+            )
+            st.plotly_chart(fig_road, use_container_width=True)
+            st.caption("🟢 緑: 店舗方向  ｜  🔵 ブルー: 逆方向・横断  ｜  線幅 = 通行者数")
+        elif rdf is not None and rdf.empty:
+            st.warning("閾値を超える道路経路が見つかりませんでした。閾値を下げてください。")
