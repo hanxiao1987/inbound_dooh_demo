@@ -412,6 +412,24 @@ def build_sankey(passages_df: pd.DataFrame,
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 4b: 来店直前経路分析
 # ─────────────────────────────────────────────────────────────────────────────
+SPEED_LOW_KMH  = 5.0   # ≤ 5 km/h : 低速（歩行・停滞）
+SPEED_MID_KMH  = 15.0  # 5‒15 km/h: 中速（早歩き・自転車）
+                        # > 15 km/h: 高速（乗り物）
+SPEED_COLORS = {
+    "低速": "rgba(39,174,96,0.85)",   # 緑: 歩行 ← DOOH 訴求に最適
+    "中速": "rgba(230,126,34,0.80)",  # オレンジ: 早歩き
+    "高速": "rgba(192,57,43,0.75)",   # 赤: 乗り物
+}
+
+
+def _speed_cat(kmh: float) -> str:
+    if kmh <= SPEED_LOW_KMH:
+        return "低速"
+    elif kmh <= SPEED_MID_KMH:
+        return "中速"
+    return "高速"
+
+
 def analyze_pre_arrival_routes(gps_df: pd.DataFrame,
                                 store_visits: pd.DataFrame,
                                 store_lat: float, store_lon: float,
@@ -420,7 +438,8 @@ def analyze_pre_arrival_routes(gps_df: pd.DataFrame,
     """
     百貨店到着前 pre_minutes 分以内の GPS 点を連結してセグメント化。
     通行人数が threshold_pct % 以上のセグメントを返す。
-    Returns: [lat1,lon1,lat2,lon2,count,pct,approaching,bearing]
+    Returns: [lat1,lon1,lat2,lon2,count,pct,approaching,bearing,
+              低速,中速,高速,dominant_speed]
     """
     if store_visits.empty:
         return pd.DataFrame()
@@ -430,36 +449,49 @@ def analyze_pre_arrival_routes(gps_df: pd.DataFrame,
 
     for _, visit in store_visits.iterrows():
         t0 = visit.arrival_time - timedelta(minutes=pre_minutes)
-        pts = (gps_df[
+        sub = (gps_df[
             (gps_df["member_id"] == visit.member_id) &
             (gps_df["stay_datetime"] >= t0) &
             (gps_df["stay_datetime"] <= visit.arrival_time)
-        ].sort_values("stay_datetime")[["lat", "lon"]].values)
+        ].sort_values("stay_datetime").reset_index(drop=True))
 
-        if len(pts) < 2:
+        if len(sub) < 2:
             continue
-        for i in range(len(pts) - 1):
-            la1, lo1 = round(pts[i][0], 4),   round(pts[i][1], 4)
-            la2, lo2 = round(pts[i+1][0], 4), round(pts[i+1][1], 4)
+
+        for i in range(len(sub) - 1):
+            r0, r1 = sub.iloc[i], sub.iloc[i + 1]
+            la1, lo1 = round(r0.lat, 4), round(r0.lon, 4)
+            la2, lo2 = round(r1.lat, 4), round(r1.lon, 4)
             if la1 == la2 and lo1 == lo2:
                 continue
+
+            # 速度計算: 出発時刻 = 滞在開始 + 滞在時間
+            depart = r0.stay_datetime + timedelta(minutes=float(r0.stay_duration_min))
+            travel_s = max(30.0, (r1.stay_datetime - depart).total_seconds())
+            dist_m = haversine_m(la1, lo1, la2, lo2)
+            speed_kmh = dist_m / travel_s * 3.6
+
             brg = bearing_deg(la1, lo1, la2, lo2)
-            mid_lat, mid_lon = (la1+la2)/2, (lo1+lo2)/2
+            mid_lat, mid_lon = (la1 + la2) / 2, (lo1 + lo2) / 2
             brg_store = bearing_deg(mid_lat, mid_lon, store_lat, store_lon)
             diff = abs(brg - brg_store)
-            if diff > 180: diff = 360 - diff
+            if diff > 180:
+                diff = 360 - diff
             segs.append({
-                "member_id":  visit.member_id,
+                "member_id":   visit.member_id,
                 "lat1": la1, "lon1": lo1,
                 "lat2": la2, "lon2": lo2,
-                "bearing":    brg,
+                "bearing":     brg,
                 "approaching": diff < 90,
+                "speed_cat":   _speed_cat(speed_kmh),
             })
 
     if not segs:
         return pd.DataFrame()
 
     df = pd.DataFrame(segs)
+
+    # セグメントごとの総通行人数
     grp = (df.groupby(["lat1","lon1","lat2","lon2","approaching"])["member_id"]
              .nunique().reset_index()
              .rename(columns={"member_id": "count"}))
@@ -468,6 +500,21 @@ def analyze_pre_arrival_routes(gps_df: pd.DataFrame,
     grp = grp[grp["count"] >= threshold].copy()
     if grp.empty:
         return pd.DataFrame()
+
+    # 速度カテゴリ別人数をピボット
+    spd = (df.groupby(["lat1","lon1","lat2","lon2","approaching","speed_cat"])["member_id"]
+             .nunique().reset_index()
+             .rename(columns={"member_id": "spd_n"}))
+    pivot = (spd.pivot_table(index=["lat1","lon1","lat2","lon2","approaching"],
+                              columns="speed_cat", values="spd_n", fill_value=0)
+               .reset_index())
+    for col in ["低速", "中速", "高速"]:
+        if col not in pivot.columns:
+            pivot[col] = 0
+
+    grp = grp.merge(pivot, on=["lat1","lon1","lat2","lon2","approaching"], how="left")
+    grp[["低速","中速","高速"]] = grp[["低速","中速","高速"]].fillna(0).astype(int)
+    grp["dominant_speed"] = grp[["低速","中速","高速"]].idxmax(axis=1)
 
     grp["bearing"] = grp.apply(
         lambda r: bearing_deg(r.lat1, r.lon1, r.lat2, r.lon2), axis=1
@@ -875,45 +922,113 @@ elif mode == "🗺️ 来店直前の経路特定":
         st.stop()
 
     n_total = store_visits_df["member_id"].nunique()
-    n_app   = segs_df[segs_df["approaching"]]["count"].sum()
+    app_segs = segs_df[segs_df["approaching"]]
+    n_app    = app_segs["count"].sum()
     c1, c2, c3 = st.columns(3)
-    c1.metric("有効セグメント数",        f"{len(segs_df):,}")
-    c2.metric("店舗方向 延べ通行数",     f"{n_app:,}")
-    c3.metric("分析対象来訪者",          f"{n_total:,}")
+    c1.metric("有効セグメント数",    f"{len(segs_df):,}")
+    c2.metric("店舗方向 延べ通行数", f"{n_app:,}")
+    c3.metric("分析対象来訪者",      f"{n_total:,}")
 
-    # ── 経路地図 ──────────────────────────────────────────────────────────────
+    # ── 速度別割合（来店方向セグメントのみ） ─────────────────────────────────
+    if not app_segs.empty and all(c in app_segs.columns for c in ["低速","中速","高速"]):
+        st.subheader("🚶 通行速度別 割合（店舗方向）")
+        st.caption(
+            f"低速 ≤ {SPEED_LOW_KMH:.0f} km/h（歩行）｜"
+            f"中速 {SPEED_LOW_KMH:.0f}–{SPEED_MID_KMH:.0f} km/h（早歩き・自転車）｜"
+            f"高速 > {SPEED_MID_KMH:.0f} km/h（乗り物）"
+        )
+        total_low  = int(app_segs["低速"].sum())
+        total_mid  = int(app_segs["中速"].sum())
+        total_high = int(app_segs["高速"].sum())
+        total_spd  = total_low + total_mid + total_high or 1
+
+        mc1, mc2, mc3 = st.columns(3)
+        mc1.metric("🟢 低速（歩行）",
+                   f"{total_low:,} 件",
+                   f"{total_low/total_spd*100:.1f}%")
+        mc2.metric("🟠 中速（早歩き）",
+                   f"{total_mid:,} 件",
+                   f"{total_mid/total_spd*100:.1f}%")
+        mc3.metric("🔴 高速（乗り物）",
+                   f"{total_high:,} 件",
+                   f"{total_high/total_spd*100:.1f}%")
+
+        # 速度別 円グラフ
+        fig_spd = go.Figure(go.Pie(
+            labels=["低速（歩行）", "中速（早歩き）", "高速（乗り物）"],
+            values=[total_low, total_mid, total_high],
+            marker_colors=[SPEED_COLORS["低速"], SPEED_COLORS["中速"], SPEED_COLORS["高速"]],
+            hole=0.45,
+            textinfo="label+percent",
+            hovertemplate="%{label}: %{value} 件 (%{percent})<extra></extra>",
+        ))
+        fig_spd.update_layout(
+            height=300, margin=dict(t=20, b=20, l=20, r=20),
+            showlegend=False,
+        )
+        st.plotly_chart(fig_spd, use_container_width=True)
+
+    # ── 経路地図（速度別色分け） ──────────────────────────────────────────────
     st.subheader("🗺️ 来店前経路マップ")
-    st.caption("🟠 オレンジ太線: 店舗方向  ｜  🔵 ブルー細線: 逆方向・横断  ｜  線幅 = 通行者数に比例")
+    st.caption(
+        "🟢 緑: 低速（歩行）｜🟠 オレンジ: 中速｜🔴 赤: 高速（乗り物）"
+        "  ／  🔵 ブルー細線: 逆方向・横断  ｜  線幅 = 通行者数に比例"
+    )
 
     fig_rt = go.Figure()
-    max_cnt = segs_df["count"].max()
+    max_cnt = segs_df["count"].max() or 1
+    has_speed = "dominant_speed" in segs_df.columns
 
-    # 方向別に 2 トレース（凡例用）
-    for approaching, color, label in [
-        (True,  "rgba(230,126,34,0.80)", "→ 店舗方向"),
-        (False, "rgba(52,152,219,0.65)", "← 逆方向・横断"),
-    ]:
-        grp = segs_df[segs_df["approaching"] == approaching]
-        if grp.empty:
-            continue
-        # 各セグメントを個別トレースとして追加（線幅を変えるため）
-        for _, seg in grp.iterrows():
+    # ── 来店方向: 支配的速度カテゴリで色分け ─────────────────────────────────
+    if has_speed:
+        for spd_cat, color in SPEED_COLORS.items():
+            grp = app_segs[app_segs["dominant_speed"] == spd_cat]
+            for _, seg in grp.iterrows():
+                w = max(1.5, min(10, seg["count"] / max_cnt * 10))
+                fig_rt.add_trace(go.Scattermapbox(
+                    lat=[seg.lat1, seg.lat2], lon=[seg.lon1, seg.lon2],
+                    mode="lines", line=dict(color=color, width=w),
+                    hovertemplate=(
+                        f"→ 店舗方向 [{spd_cat}]<br>"
+                        f"{seg['count']} 人 ({seg['pct']:.1f}%)<br>"
+                        f"低速:{int(seg['低速'])} 中速:{int(seg['中速'])} 高速:{int(seg['高速'])}"
+                        "<extra></extra>"
+                    ),
+                    showlegend=False,
+                ))
+        # 凡例ダミー（速度別）
+        for spd_cat, color in SPEED_COLORS.items():
+            fig_rt.add_trace(go.Scattermapbox(
+                lat=[store_lat], lon=[store_lon], mode="markers",
+                marker=dict(size=0, opacity=0),
+                name=f"→ 店舗方向 [{spd_cat}]", showlegend=True,
+                line=dict(color=color),
+            ))
+    else:
+        # フォールバック（速度列なし）
+        for _, seg in app_segs.iterrows():
             w = max(1.5, min(10, seg["count"] / max_cnt * 10))
             fig_rt.add_trace(go.Scattermapbox(
-                lat=[seg.lat1, seg.lat2],
-                lon=[seg.lon1, seg.lon2],
-                mode="lines",
-                line=dict(color=color, width=w),
-                hovertemplate=(
-                    f"{label}<br>{seg['count']} 人 ({seg['pct']:.1f}%)<extra></extra>"
-                ),
+                lat=[seg.lat1, seg.lat2], lon=[seg.lon1, seg.lon2],
+                mode="lines", line=dict(color="rgba(230,126,34,0.80)", width=w),
+                hovertemplate=f"→ 店舗方向<br>{seg['count']} 人 ({seg['pct']:.1f}%)<extra></extra>",
                 showlegend=False,
             ))
-        # 凡例ダミー
+
+    # ── 逆方向・横断（ブルー細線） ────────────────────────────────────────────
+    non_app = segs_df[~segs_df["approaching"]]
+    for _, seg in non_app.iterrows():
+        w = max(1.0, min(5, seg["count"] / max_cnt * 5))
         fig_rt.add_trace(go.Scattermapbox(
-            lat=[store_lat], lon=[store_lon], mode="markers",
-            marker=dict(size=0, opacity=0), name=label, showlegend=True,
+            lat=[seg.lat1, seg.lat2], lon=[seg.lon1, seg.lon2],
+            mode="lines", line=dict(color="rgba(52,152,219,0.55)", width=w),
+            hovertemplate=f"← 逆方向<br>{seg['count']} 人 ({seg['pct']:.1f}%)<extra></extra>",
+            showlegend=False,
         ))
+    fig_rt.add_trace(go.Scattermapbox(
+        lat=[store_lat], lon=[store_lon], mode="markers",
+        marker=dict(size=0, opacity=0), name="← 逆方向・横断", showlegend=True,
+    ))
 
     # 百貨店
     fig_rt.add_trace(go.Scattermapbox(
@@ -925,7 +1040,7 @@ elif mode == "🗺️ 来店直前の経路特定":
     fig_rt.update_layout(
         mapbox=dict(style="open-street-map",
                     center=dict(lat=store_lat, lon=store_lon), zoom=15),
-        height=560, margin=dict(r=0,t=0,l=0,b=0),
+        height=580, margin=dict(r=0, t=0, l=0, b=0),
         legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01,
                     bgcolor="rgba(255,255,255,0.9)"),
     )
@@ -1013,7 +1128,8 @@ elif mode == "🗺️ 来店直前の経路特定":
         show = segs_df.head(30).copy()
         show["方向"] = show["approaching"].map({True: "→ 店舗方向", False: "← 逆/横断"})
         show["通行率 (%)"] = show["pct"].round(1)
-        st.dataframe(
-            show[["lat1","lon1","lat2","lon2","count","通行率 (%)","方向"]],
-            use_container_width=True, hide_index=True,
-        )
+        cols = ["lat1","lon1","lat2","lon2","count","通行率 (%)","方向"]
+        if all(c in show.columns for c in ["低速","中速","高速","dominant_speed"]):
+            show = show.rename(columns={"dominant_speed": "支配速度"})
+            cols += ["低速","中速","高速","支配速度"]
+        st.dataframe(show[cols], use_container_width=True, hide_index=True)
