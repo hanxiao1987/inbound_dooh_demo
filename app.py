@@ -542,6 +542,7 @@ for k, v in [
     ("prev_night_df", None), ("analysis_mode", None),
     ("dooh_passages_df", None), ("dooh_n_sel", 0),
     ("route_segs_df", None), ("route_dooh_df", None),
+    ("_gps_file_key", None),
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -575,15 +576,19 @@ with col_up:
 サンプルデータ: `generate_sample_gps.py` で生成してください。
 """)
     uploaded = st.file_uploader("GPS データ CSV", type=["csv"])
-    if uploaded:
-        df_tmp = load_gps_csv(uploaded)
-        if df_tmp is not None:
-            st.session_state.update({
-                "gps_df": df_tmp, "hotels_df": None,
-                "prev_night_df": None, "store_visitors": None,
-                "dooh_passages_df": None, "route_segs_df": None, "route_dooh_df": None,
-            })
-            st.success(f"✅ {len(df_tmp):,} レコード / {df_tmp['member_id'].nunique():,} メンバー")
+    if uploaded is not None:
+        # ファイルが新しい場合のみ処理（リランのたびに再実行しない）
+        _fkey = f"{uploaded.name}_{uploaded.size}"
+        if st.session_state.get("_gps_file_key") != _fkey:
+            df_tmp = load_gps_csv(uploaded)
+            if df_tmp is not None:
+                st.session_state.update({
+                    "gps_df": df_tmp, "hotels_df": None,
+                    "prev_night_df": None, "store_visitors": None,
+                    "dooh_passages_df": None, "route_segs_df": None, "route_dooh_df": None,
+                    "_gps_file_key": _fkey,
+                })
+                st.success(f"✅ {len(df_tmp):,} レコード / {df_tmp['member_id'].nunique():,} メンバー")
 
 if st.session_state["gps_df"] is None:
     st.info("GPS データ CSV をアップロードしてください。")
