@@ -575,60 +575,6 @@ out center;"""
     return df.sort_values("dist_m").reset_index(drop=True)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# OSM 道路ネットワーク取得（Overpass API）
-# ─────────────────────────────────────────────────────────────────────────────
-_OVERPASS_ENDPOINTS = [
-    "https://overpass-api.de/api/interpreter",
-    "https://lz4.overpass-api.de/api/interpreter",
-    "https://z.overpass-api.de/api/interpreter",
-]
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_osm_roads(center_lat: float, center_lon: float,
-                    radius_m: float = 800) -> tuple:
-    """Overpass API から道路ジオメトリを取得し (road_segments, status_msg) を返す。
-    複数エンドポイントにフォールバックして 504 を回避。
-    road_segments: list of [(lon, lat), ...]"""
-    dlat = radius_m / 111320 * 1.1
-    dlon = radius_m / (111320 * math.cos(math.radians(center_lat))) * 1.1
-    s = center_lat - dlat
-    n = center_lat + dlat
-    w = center_lon - dlon
-    e = center_lon + dlon
-
-    # 歩行者動線に必要な highway タイプのみに絞る（データ量削減）
-    query = (
-        f"[out:json][timeout:25][maxsize:8388608];\n"
-        f"(\n"
-        f'  way["highway"~"^(primary|secondary|tertiary|residential|'
-        f'pedestrian|footway|path|living_street)$"]'
-        f"({s:.6f},{w:.6f},{n:.6f},{e:.6f});\n"
-        f");\n"
-        f"out geom;"
-    )
-    data = urllib.parse.urlencode({"data": query}).encode()
-    last_err = "不明なエラー"
-    for endpoint in _OVERPASS_ENDPOINTS:
-        req = urllib.request.Request(endpoint, data=data, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=35) as r:
-                result = json.loads(r.read())
-            road_segs = []
-            for way in result.get("elements", []):
-                if way.get("type") == "way":
-                    pts = [(nd["lon"], nd["lat"])
-                           for nd in way.get("geometry", []) if "lon" in nd]
-                    if len(pts) >= 2:
-                        road_segs.append(pts)
-            return road_segs, f"✅ OSM 道路セグメント {len(road_segs):,} 本取得"
-        except Exception as e:
-            last_err = str(e)
-            continue  # 次のエンドポイントを試す
-
-    return [], f"❌ OSM 道路取得エラー（全エンドポイント失敗）: {last_err}"
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 1: 百貨店訪問者特定
