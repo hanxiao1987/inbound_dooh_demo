@@ -5,30 +5,32 @@
 
 想定シナリオ:
   - 対象百貨店: 新宿高島屋タイムズスクエア (35.6886, 139.7024)
-  - 新宿エリアのホテルに滞在するインバウンド旅行者 300 名
-  - 7 日間 (2024-03-01 〜 2024-03-07)
-  - 各メンバー: ホテル宿泊 (夜間長時間滞在) → 翌日 DOOH 周辺を経由 → 百貨店訪問
+  - インバウンド旅行者 300 名 / 7 日間 (2024-03-01 〜 2024-03-07)
+  - 70% (210 名): 新宿エリアのホテル泊 → DOOH 周辺を経由 → 百貨店訪問
+  - 30% ( 90 名): 遠方エリア（銀座・渋谷・池袋・浅草・六本木）のホテル泊
+                  → 新宿駅に到着 → DOOH 周辺を経由 → 百貨店訪問
 """
 
+import csv
 import math
 import random
 from datetime import datetime, timedelta
 
 import numpy as np
-import pandas as pd
 
-RANDOM_SEED   = 42
-BASE_DATE_STR = "2024-03-01"
-N_MEMBERS     = 300
-N_DAYS        = 7
+RANDOM_SEED      = 42
+BASE_DATE_STR    = "2024-03-01"
+N_MEMBERS        = 300
+N_DAYS           = 7
+REMOTE_RATIO     = 0.30   # 遠方ホテル泊の割合
 
 # ── 対象百貨店: 新宿高島屋タイムズスクエア ───────────────────────────────────
 STORE_LAT  = 35.6886
 STORE_LON  = 139.7024
 STORE_NAME = "新宿高島屋"
 
-# ── ホテルリスト（新宿エリア）──────────────────────────────────────────────────
-HOTELS = [
+# ── ホテルリスト（新宿エリア・近距離）────────────────────────────────────────
+HOTELS_LOCAL = [
     {"id": "H01", "name": "ハイアット リージェンシー 東京（仮）", "lat": 35.6908, "lon": 139.6937},
     {"id": "H02", "name": "京王プラザホテル",                     "lat": 35.6946, "lon": 139.6951},
     {"id": "H03", "name": "新宿ワシントンホテル（仮）",           "lat": 35.6893, "lon": 139.6973},
@@ -39,6 +41,38 @@ HOTELS = [
     {"id": "H08", "name": "コンフォートホテル新宿（仮）",         "lat": 35.6898, "lon": 139.7053},
     {"id": "H09", "name": "ホテルサンルート 新宿（仮）",          "lat": 35.6868, "lon": 139.6976},
     {"id": "H10", "name": "ベストウェスタン 新宿（仮）",          "lat": 35.6872, "lon": 139.7066},
+]
+
+# ── ホテルリスト（遠方エリア・新宿高島屋から 3km 以上）────────────────────────
+HOTELS_REMOTE = [
+    # 銀座・丸の内エリア (~5km)
+    {"id": "R01", "name": "ホテルモントレ銀座（仮）",             "lat": 35.6714, "lon": 139.7651},
+    {"id": "R02", "name": "東急ステイ銀座（仮）",                 "lat": 35.6730, "lon": 139.7620},
+    {"id": "R03", "name": "パレスホテル東京（仮）",               "lat": 35.6847, "lon": 139.7594},
+    # 渋谷エリア (~4km)
+    {"id": "R04", "name": "セルリアンタワー東急ホテル（仮）",     "lat": 35.6573, "lon": 139.7015},
+    {"id": "R05", "name": "渋谷エクセルホテル東急（仮）",         "lat": 35.6591, "lon": 139.7007},
+    {"id": "R06", "name": "コンラッド東京（仮）",                 "lat": 35.6658, "lon": 139.7575},
+    # 池袋エリア (~5km)
+    {"id": "R07", "name": "メトロポリタンホテル池袋（仮）",       "lat": 35.7295, "lon": 139.7109},
+    {"id": "R08", "name": "池袋東武ホテル（仮）",                 "lat": 35.7308, "lon": 139.7121},
+    # 浅草エリア (~7km)
+    {"id": "R09", "name": "アパホテル浅草（仮）",                 "lat": 35.7106, "lon": 139.7963},
+    {"id": "R10", "name": "浅草ビューホテル（仮）",               "lat": 35.7147, "lon": 139.7972},
+    # 六本木エリア (~4km)
+    {"id": "R11", "name": "グランドハイアット東京（仮）",         "lat": 35.6601, "lon": 139.7292},
+    {"id": "R12", "name": "ザ・リッツ・カールトン東京（仮）",     "lat": 35.6656, "lon": 139.7314},
+]
+
+# 後方互換: app.py の Overpass マッチングは HOTELS_LOCAL で十分
+HOTELS = HOTELS_LOCAL
+
+# ── 新宿駅周辺の乗降/経由スポット（遠方客の到着点として使用）──────────────────
+SHINJUKU_ARRIVAL_SPOTS = [
+    {"lat": 35.6896, "lon": 139.7006, "name": "新宿駅南口改札前"},
+    {"lat": 35.6905, "lon": 139.7013, "name": "新宿駅東口"},
+    {"lat": 35.6916, "lon": 139.6999, "name": "新宿駅西口"},
+    {"lat": 35.6877, "lon": 139.7033, "name": "新宿駅南口ルミネ前"},
 ]
 
 # ── DOOH 設置場所（新宿エリア）─ 経由地候補 ──────────────────────────────────
@@ -81,16 +115,88 @@ def haversine_m(lat1, lon1, lat2, lon2) -> float:
     return R * 2 * math.asin(math.sqrt(a))
 
 
-def generate() -> pd.DataFrame:
+def _add_rec(records, mid, lat, lon, dt, dur):
+    records.append({
+        "member_id":         mid,
+        "lat":               lat,
+        "lon":               lon,
+        "stay_datetime":     dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "stay_duration_min": round(dur, 1),
+    })
+
+
+def _store_visit_day(records, mid, hotel, near_dooh, rng, np_rng, date, is_remote):
+    """百貨店訪問日の経路を生成（近距離・遠方共通）"""
+    hour   = rng.randint(9, 11)
+    minute = rng.randint(0, 59)
+
+    # 遠方ホテル泊メンバー: 新宿駅到着スポットを最初に経由
+    if is_remote:
+        arr = rng.choice(SHINJUKU_ARRIVAL_SPOTS)
+        dur = rng.uniform(5, 20)   # 乗換・改札通過
+        jl  = arr["lat"] + np_rng.uniform(-0.0001, 0.0001)
+        jlo = arr["lon"] + np_rng.uniform(-0.0001, 0.0001)
+        _add_rec(records, mid, round(jl, 6), round(jlo, 6),
+                 date + timedelta(hours=hour, minutes=minute), dur)
+        minute += int(dur) + rng.randint(3, 10)
+        if minute >= 60:
+            hour += minute // 60; minute = minute % 60
+
+    # DOOH 経由（1〜3 箇所）
+    n_wp  = rng.randint(1, 3)
+    wayps = near_dooh[:6]
+    wayps = rng.sample(wayps, min(n_wp, len(wayps)))
+    wayps = sorted(wayps,
+                   key=lambda d: haversine_m(d["lat"], d["lon"], STORE_LAT, STORE_LON),
+                   reverse=True)
+
+    for wp in wayps:
+        dur = rng.uniform(10, 35)
+        jl  = wp["lat"] + np_rng.uniform(-0.0001, 0.0001)
+        jlo = wp["lon"] + np_rng.uniform(-0.0001, 0.0001)
+        _add_rec(records, mid, round(jl, 6), round(jlo, 6),
+                 date + timedelta(hours=hour, minutes=minute), dur)
+        minute += int(dur) + rng.randint(5, 15)
+        if minute >= 60:
+            hour += minute // 60; minute = minute % 60
+
+    # 直前カフェ等（50% 確率）
+    if rng.random() < 0.5:
+        sp  = rng.choice(DAYTIME_SPOTS)
+        dur = rng.uniform(10, 30)
+        jl  = sp["lat"] + np_rng.uniform(-0.0002, 0.0002)
+        jlo = sp["lon"] + np_rng.uniform(-0.0002, 0.0002)
+        _add_rec(records, mid, round(jl, 6), round(jlo, 6),
+                 date + timedelta(hours=hour, minutes=minute), dur)
+        minute += int(dur) + rng.randint(5, 15)
+        if minute >= 60:
+            hour += minute // 60; minute = minute % 60
+
+    # 百貨店到着
+    dur_store = rng.uniform(60, 180)
+    jl  = STORE_LAT + np_rng.uniform(-0.0003, 0.0003)
+    jlo = STORE_LON + np_rng.uniform(-0.0003, 0.0003)
+    arrive = date + timedelta(hours=hour, minutes=minute + rng.randint(3, 15))
+    _add_rec(records, mid, round(jl, 6), round(jlo, 6), arrive, dur_store)
+
+
+FIELDS = ["member_id", "lat", "lon", "stay_datetime", "stay_duration_min"]
+
+
+def generate():
     rng    = random.Random(RANDOM_SEED)
     np_rng = np.random.default_rng(RANDOM_SEED)
     base   = datetime.strptime(BASE_DATE_STR, "%Y-%m-%d")
 
+    n_remote = int(N_MEMBERS * REMOTE_RATIO)   # 90 名: 遠方ホテル泊
+
     records = []
 
     for m_idx in range(N_MEMBERS):
-        mid   = f"M{m_idx+1:05d}"
-        hotel = rng.choice(HOTELS)
+        mid       = "M{:05d}".format(m_idx + 1)
+        is_remote = m_idx < n_remote           # 先頭 30% を遠方グループに
+        hotel     = (rng.choice(HOTELS_REMOTE) if is_remote
+                     else rng.choice(HOTELS_LOCAL))
 
         # 滞在日数（3〜7 日）と百貨店訪問日
         stay_days   = rng.randint(3, N_DAYS)
@@ -99,7 +205,7 @@ def generate() -> pd.DataFrame:
         n_visits    = rng.randint(1, min(3, len(hotel_days)))
         store_days  = sorted(rng.sample(hotel_days, n_visits))
 
-        # ホテルから各 DOOH までの距離で近い順にソート（経由優先度付け）
+        # DOOH の距離優先順（新宿駅系を先に）
         near_dooh = sorted(
             DOOH_WAYPOINTS,
             key=lambda d: haversine_m(hotel["lat"], hotel["lon"], d["lat"], d["lon"])
@@ -108,123 +214,60 @@ def generate() -> pd.DataFrame:
         for day_off in hotel_days:
             date = base + timedelta(days=day_off)
 
-            # ── ホテル宿泊レコード（夜間 20〜23 時チェックイン、6〜9 時間） ──
+            # ── ホテル宿泊レコード ──
             ci_h   = rng.randint(20, 23)
             ci_min = rng.randint(0, 59)
             dur_h  = rng.uniform(360, 540)
             jlat   = hotel["lat"] + np_rng.uniform(-0.0001, 0.0001)
             jlon   = hotel["lon"] + np_rng.uniform(-0.0001, 0.0001)
-            records.append({
-                "member_id":         mid,
-                "lat":               round(jlat, 6),
-                "lon":               round(jlon, 6),
-                "stay_datetime":     (date + timedelta(hours=ci_h, minutes=ci_min)
-                                      ).strftime("%Y-%m-%d %H:%M:%S"),
-                "stay_duration_min": round(dur_h, 1),
-            })
+            _add_rec(records, mid, round(jlat, 6), round(jlon, 6),
+                     date + timedelta(hours=ci_h, minutes=ci_min), dur_h)
 
             if day_off not in store_days:
                 # 百貨店訪問なし: 日中スポット 1〜2 件
-                spots = rng.sample(DAYTIME_SPOTS, rng.randint(1, 2))
-                hour  = rng.randint(10, 16)
-                for sp in spots:
+                hour = rng.randint(10, 16)
+                for sp in rng.sample(DAYTIME_SPOTS, rng.randint(1, 2)):
                     dur = rng.uniform(*sp["dur"])
                     jl  = sp["lat"] + np_rng.uniform(-0.0002, 0.0002)
                     jlo = sp["lon"] + np_rng.uniform(-0.0002, 0.0002)
-                    records.append({
-                        "member_id":         mid,
-                        "lat":               round(jl, 6),
-                        "lon":               round(jlo, 6),
-                        "stay_datetime":     (date + timedelta(hours=hour,
-                                              minutes=rng.randint(0, 59))
-                                              ).strftime("%Y-%m-%d %H:%M:%S"),
-                        "stay_duration_min": round(dur, 1),
-                    })
+                    _add_rec(records, mid, round(jl, 6), round(jlo, 6),
+                             date + timedelta(hours=hour, minutes=rng.randint(0, 59)), dur)
                     hour += max(1, int(dur / 60) + 1)
-                continue
+            else:
+                _store_visit_day(records, mid, hotel, near_dooh,
+                                 rng, np_rng, date, is_remote)
 
-            # ── 百貨店訪問日 ──────────────────────────────────────────────────
-            hour   = rng.randint(9, 11)
-            minute = rng.randint(0, 59)
-
-            # ① ホテル近くの DOOH 1〜3 箇所を経由（GPS 滞在点として記録）
-            n_wp  = rng.randint(1, 3)
-            wayps = near_dooh[:6]                  # 近い 6 候補から
-            wayps = rng.sample(wayps, min(n_wp, len(wayps)))
-
-            # ホテル→百貨店方向に並べ替え（百貨店に近い順）
-            wayps = sorted(
-                wayps,
-                key=lambda d: haversine_m(d["lat"], d["lon"], STORE_LAT, STORE_LON),
-                reverse=True,  # 遠い順（ホテル寄りから）
-            )
-
-            for wp in wayps:
-                dur = rng.uniform(10, 35)
-                jl  = wp["lat"] + np_rng.uniform(-0.0001, 0.0001)
-                jlo = wp["lon"] + np_rng.uniform(-0.0001, 0.0001)
-                records.append({
-                    "member_id":         mid,
-                    "lat":               round(jl, 6),
-                    "lon":               round(jlo, 6),
-                    "stay_datetime":     (date + timedelta(hours=hour, minutes=minute)
-                                          ).strftime("%Y-%m-%d %H:%M:%S"),
-                    "stay_duration_min": round(dur, 1),
-                })
-                minute += int(dur) + rng.randint(5, 15)
-                if minute >= 60:
-                    hour  += minute // 60
-                    minute  = minute % 60
-
-            # ② 直前にもう 1 スポット（近隣カフェ等）
-            if rng.random() < 0.5:
-                sp  = rng.choice(DAYTIME_SPOTS)
-                dur = rng.uniform(10, 30)
-                jl  = sp["lat"] + np_rng.uniform(-0.0002, 0.0002)
-                jlo = sp["lon"] + np_rng.uniform(-0.0002, 0.0002)
-                records.append({
-                    "member_id":         mid,
-                    "lat":               round(jl, 6),
-                    "lon":               round(jlo, 6),
-                    "stay_datetime":     (date + timedelta(hours=hour, minutes=minute)
-                                          ).strftime("%Y-%m-%d %H:%M:%S"),
-                    "stay_duration_min": round(dur, 1),
-                })
-                minute += int(dur) + rng.randint(5, 15)
-                if minute >= 60:
-                    hour  += minute // 60
-                    minute  = minute % 60
-
-            # ③ 百貨店到着
-            dur_store = rng.uniform(60, 180)
-            jl  = STORE_LAT + np_rng.uniform(-0.0003, 0.0003)
-            jlo = STORE_LON + np_rng.uniform(-0.0003, 0.0003)
-            arrive = date + timedelta(hours=hour, minutes=minute + rng.randint(3, 15))
-            records.append({
-                "member_id":         mid,
-                "lat":               round(jl, 6),
-                "lon":               round(jlo, 6),
-                "stay_datetime":     arrive.strftime("%Y-%m-%d %H:%M:%S"),
-                "stay_duration_min": round(dur_store, 1),
-            })
-
-    df = pd.DataFrame(records)
-    df = df.sample(frac=1, random_state=RANDOM_SEED).reset_index(drop=True)
-    return df
+    # shuffle
+    rng2 = random.Random(RANDOM_SEED)
+    rng2.shuffle(records)
+    return records
 
 
 if __name__ == "__main__":
-    print(f"擬似 GPS データを生成中（対象: {STORE_NAME}）...")
-    df = generate()
+    print("擬似 GPS データを生成中（対象: {}）...".format(STORE_NAME))
+    records = generate()
     out = "sample_gps_data.csv"
-    df.to_csv(out, index=False, encoding="utf-8-sig")
-    sz = len(df.to_csv(index=False).encode("utf-8")) / 1024
-    print(f"✅ {len(df):,} レコード / {df['member_id'].nunique():,} メンバー")
-    print(f"   期間: {df['stay_datetime'].min()} 〜 {df['stay_datetime'].max()}")
-    print(f"   緯度範囲: {df['lat'].min():.4f} 〜 {df['lat'].max():.4f}")
-    print(f"   経度範囲: {df['lon'].min():.4f} 〜 {df['lon'].max():.4f}")
-    print(f"   ファイルサイズ: {sz:.0f} KB → {out}")
-    print(f"\nアプリ設定:")
-    print(f"   百貨店名: {STORE_NAME}")
-    print(f"   緯度: {STORE_LAT} / 経度: {STORE_LON}")
-    print(f"   訪問判定半径: 150m 推奨")
+    with open(out, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDS)
+        writer.writeheader()
+        writer.writerows(records)
+
+    n = len(records)
+    members = len({r["member_id"] for r in records})
+    lats = [r["lat"] for r in records]
+    lons = [r["lon"] for r in records]
+    dts  = sorted(r["stay_datetime"] for r in records)
+    sz   = sum(len(",".join(str(r[f]) for f in FIELDS) + "\n").bit_length() // 8
+               for r in records) // 1024  # rough estimate
+    import os
+    sz_kb = os.path.getsize(out) // 1024
+
+    print("✅ {:,} レコード / {:,} メンバー".format(n, members))
+    print("   期間: {} 〜 {}".format(dts[0], dts[-1]))
+    print("   緯度範囲: {:.4f} 〜 {:.4f}".format(min(lats), max(lats)))
+    print("   経度範囲: {:.4f} 〜 {:.4f}".format(min(lons), max(lons)))
+    print("   ファイルサイズ: {} KB → {}".format(sz_kb, out))
+    print("\nアプリ設定:")
+    print("   百貨店名: {}".format(STORE_NAME))
+    print("   緯度: {} / 経度: {}".format(STORE_LAT, STORE_LON))
+    print("   訪問判定半径: 150m 推奨")

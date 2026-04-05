@@ -315,10 +315,12 @@ def fetch_plateau_roads(center_lat: float, center_lon: float,
 
 def build_road_network(road_segments: list):
     """
-    道路セグメント [(lon,lat),...] リストから networkx グラフを構築。
-    Returns (G, node_arr, node_key_to_id)
+    道路セグメント [(lon,lat),...] リストから networkx グラフと
+    scipy sparse 行列を構築。
+    Returns (G, node_arr, node_key_to_id, sp_graph)
     """
     import networkx as nx
+    from scipy.sparse import csr_matrix
 
     G = nx.Graph()
     node_key_to_id: dict = {}
@@ -346,7 +348,18 @@ def build_road_network(road_segments: list):
             prev = nid
 
     node_arr = np.array(node_coords) if node_coords else np.empty((0, 2))
-    return G, node_arr, node_key_to_id
+
+    # scipy sparse 行列（Dijkstra 高速化用）
+    n = len(node_key_to_id)
+    if n > 0 and G.number_of_edges() > 0:
+        r, c, d = [], [], []
+        for u, v, w in G.edges(data="weight"):
+            r += [u, v]; c += [v, u]; d += [w, w]
+        sp_graph = csr_matrix((d, (r, c)), shape=(n, n))
+    else:
+        sp_graph = None
+
+    return G, node_arr, node_key_to_id, sp_graph
 
 
 def compute_road_routes(gps_df: pd.DataFrame,
@@ -354,13 +367,13 @@ def compute_road_routes(gps_df: pd.DataFrame,
                          G, node_arr, node_key_to_id: dict,
                          store_lat: float, store_lon: float,
                          pre_minutes: int = 30,
-                         threshold_pct: float = 5.0) -> pd.DataFrame:
+                         threshold_pct: float = 5.0,
+                         sp_graph=None) -> pd.DataFrame:
     """
     GPS 滞留点を道路ネットワークにスナップして最短経路を計算。
-    道路エッジごとの通過者数を集計して返す。
+    scipy Dijkstra（C実装・全ソース一括）で高速化。
     Returns: DataFrame [lon1,lat1,lon2,lat2,count,pct,approaching]
     """
-    import networkx as nx
     from scipy.spatial import KDTree
 
     if store_visits_df.empty or node_arr.shape[0] == 0:
@@ -370,42 +383,97 @@ def compute_road_routes(gps_df: pd.DataFrame,
     tree = KDTree(node_arr)
     id_to_key = {v: k for k, v in node_key_to_id.items()}
 
-    def snap(lon, lat):
-        _, idx = tree.query([lon, lat])
-        return int(idx)
+    # ── GPS データを member_id で事前グルーピング（ループ内 O(N) スキャン排除）
+    gps_by_member = {mid: grp.sort_values("stay_datetime")
+                     for mid, grp in gps_df.groupby("member_id")}
 
-    edge_members: dict = {}  # (n1,n2) → set of member_ids
-
+    # ── 来店前 pre_minutes の GPS 点列を収集
+    member_pts: list = []
     for _, visit in store_visits_df.iterrows():
         t0 = visit.arrival_time - timedelta(minutes=pre_minutes)
-        sub = (gps_df[
-            (gps_df["member_id"] == visit.member_id) &
-            (gps_df["stay_datetime"] >= t0) &
-            (gps_df["stay_datetime"] <= visit.arrival_time)
-        ].sort_values("stay_datetime").reset_index(drop=True))
-
+        sub = gps_by_member.get(visit.member_id)
+        if sub is None:
+            continue
+        sub = sub[(sub["stay_datetime"] >= t0) &
+                  (sub["stay_datetime"] <= visit.arrival_time)]
         if len(sub) < 2:
             continue
+        pts = list(zip(sub["lon"].values, sub["lat"].values))
+        member_pts.append((visit.member_id, pts))
 
-        pts = [(row.lon, row.lat) for _, row in sub.iterrows()]
+    if not member_pts:
+        return pd.DataFrame()
+
+    # ── 全ユニーク GPS 座標を一括スナップ（KDTree 呼び出し1回）
+    unique_pts = list({pt for _, pts in member_pts for pt in pts})
+    _, idxs = tree.query(unique_pts)
+    snap_map = {pt: int(idx) for pt, idx in zip(unique_pts, idxs)}
+
+    # ── メンバーごとのノードペアを収集
+    all_pairs: set = set()
+    member_pairs: dict = {}
+    for mid, pts in member_pts:
+        pairs = []
         for i in range(len(pts) - 1):
-            n1 = snap(*pts[i])
-            n2 = snap(*pts[i+1])
-            if n1 == n2:
-                continue
+            n1, n2 = snap_map[pts[i]], snap_map[pts[i + 1]]
+            if n1 != n2:
+                pairs.append((n1, n2))
+                all_pairs.add((n1, n2))
+        if pairs:
+            member_pairs[mid] = pairs
+
+    if not all_pairs:
+        return pd.DataFrame()
+
+    # ── 最短経路計算（scipy C実装 または networkx フォールバック）
+    path_cache: dict = {}
+
+    if sp_graph is not None:
+        from scipy.sparse.csgraph import dijkstra as _sp_dijkstra
+        unique_sources = list({n1 for n1, _ in all_pairs})
+        _, predecessors = _sp_dijkstra(
+            sp_graph, directed=False,
+            indices=unique_sources,
+            return_predecessors=True,
+        )
+        src_to_row = {src: i for i, src in enumerate(unique_sources)}
+
+        def _reconstruct(src, dst):
+            pred = predecessors[src_to_row[src]]
+            if pred[dst] < 0:
+                return [src, dst]
+            path, node, seen = [dst], dst, {dst}
+            while node != src:
+                p = pred[node]
+                if p < 0 or p in seen:
+                    return [src, dst]
+                seen.add(p); path.append(p); node = p
+            return list(reversed(path))
+
+        for n1, n2 in all_pairs:
+            path_cache[(n1, n2)] = _reconstruct(n1, n2)
+    else:
+        import networkx as nx
+        for n1, n2 in all_pairs:
             try:
-                path = nx.shortest_path(G, n1, n2, weight="weight")
-            except (nx.NetworkXNoPath, nx.NodeNotFound):
-                path = [n1, n2]
+                path_cache[(n1, n2)] = nx.shortest_path(G, n1, n2, weight="weight")
+            except Exception:
+                path_cache[(n1, n2)] = [n1, n2]
+
+    # ── エッジごとの通過メンバーを集計
+    edge_members: dict = {}
+    for mid, pairs in member_pairs.items():
+        for n1, n2 in pairs:
+            path = path_cache.get((n1, n2), [n1, n2])
             for j in range(len(path) - 1):
-                key = tuple(sorted([path[j], path[j+1]]))
-                edge_members.setdefault(key, set()).add(visit.member_id)
+                key = tuple(sorted([path[j], path[j + 1]]))
+                edge_members.setdefault(key, set()).add(mid)
 
     if not edge_members:
         return pd.DataFrame()
 
-    rows = []
     threshold = max(1, n_visitors * threshold_pct / 100.0)
+    rows = []
     for (n1, n2), members in edge_members.items():
         if len(members) < threshold:
             continue
@@ -431,9 +499,7 @@ def compute_road_routes(gps_df: pd.DataFrame,
 
     if not rows:
         return pd.DataFrame()
-
-    df = pd.DataFrame(rows).sort_values("count", ascending=False).reset_index(drop=True)
-    return df
+    return pd.DataFrame(rows).sort_values("count", ascending=False).reset_index(drop=True)
 
 
 def extract_dooh_near_routes(segs_df: pd.DataFrame,
@@ -535,6 +601,49 @@ out center;"""
     df = pd.DataFrame(rows).drop_duplicates("hotel_id").reset_index(drop=True)
     df["dist_m"] = df.apply(lambda r: haversine_m(r.lat, r.lon, center_lat, center_lon), axis=1)
     return df.sort_values("dist_m").reset_index(drop=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OSM 道路ネットワーク取得（Overpass API）
+# ─────────────────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_osm_roads(center_lat: float, center_lon: float,
+                    radius_m: float = 800) -> tuple:
+    """Overpass API から道路ジオメトリを取得し (road_segments, status_msg) を返す。
+    road_segments: list of [(lon, lat), ...]"""
+    dlat = radius_m / 111320 * 1.1
+    dlon = radius_m / (111320 * math.cos(math.radians(center_lat))) * 1.1
+    s = center_lat - dlat
+    n = center_lat + dlat
+    w = center_lon - dlon
+    e = center_lon + dlon
+
+    query = (
+        f"[out:json][timeout:30];\n"
+        f"(\n"
+        f'  way["highway"~"^(primary|secondary|tertiary|unclassified|residential|'
+        f'pedestrian|footway|path|living_street|service|trunk)$"]'
+        f"({s:.6f},{w:.6f},{n:.6f},{e:.6f});\n"
+        f");\n"
+        f"out geom;"
+    )
+    url  = "https://overpass-api.de/api/interpreter"
+    data = urllib.parse.urlencode({"data": query}).encode()
+    req  = urllib.request.Request(url, data=data, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=45) as r:
+            result = json.loads(r.read())
+    except Exception as e:
+        return [], f"❌ OSM 道路取得エラー: {e}"
+
+    road_segs = []
+    for way in result.get("elements", []):
+        if way.get("type") == "way":
+            pts = [(nd["lon"], nd["lat"]) for nd in way.get("geometry", []) if "lon" in nd]
+            if len(pts) >= 2:
+                road_segs.append(pts)
+
+    return road_segs, f"✅ OSM 道路セグメント {len(road_segs):,} 本取得"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -803,27 +912,34 @@ def analyze_pre_arrival_routes(gps_df: pd.DataFrame,
     n_visitors = store_visits["member_id"].nunique()
     segs = []
 
+    # GPS を member_id で事前グルーピング（ループ内 O(N) スキャン排除）
+    gps_by_member = {mid: grp.sort_values("stay_datetime")
+                     for mid, grp in gps_df.groupby("member_id")}
+
     for _, visit in store_visits.iterrows():
         t0 = visit.arrival_time - timedelta(minutes=pre_minutes)
-        sub = (gps_df[
-            (gps_df["member_id"] == visit.member_id) &
-            (gps_df["stay_datetime"] >= t0) &
-            (gps_df["stay_datetime"] <= visit.arrival_time)
-        ].sort_values("stay_datetime").reset_index(drop=True))
-
+        grp = gps_by_member.get(visit.member_id)
+        if grp is None:
+            continue
+        sub = grp[(grp["stay_datetime"] >= t0) &
+                  (grp["stay_datetime"] <= visit.arrival_time)]
         if len(sub) < 2:
             continue
 
-        for i in range(len(sub) - 1):
-            r0, r1 = sub.iloc[i], sub.iloc[i + 1]
-            la1, lo1 = round(r0.lat, 4), round(r0.lon, 4)
-            la2, lo2 = round(r1.lat, 4), round(r1.lon, 4)
+        # .values で numpy 配列化（iloc 回避）
+        cols = ["lat", "lon", "stay_datetime", "stay_duration_min"]
+        vals = sub[cols].values
+        for i in range(len(vals) - 1):
+            r0_lat, r0_lon, r0_dt, r0_dur = vals[i]
+            r1_lat, r1_lon, r1_dt, _      = vals[i + 1]
+            la1, lo1 = round(float(r0_lat), 4), round(float(r0_lon), 4)
+            la2, lo2 = round(float(r1_lat), 4), round(float(r1_lon), 4)
             if la1 == la2 and lo1 == lo2:
                 continue
 
             # 速度計算: 出発時刻 = 滞在開始 + 滞在時間
-            depart = r0.stay_datetime + timedelta(minutes=float(r0.stay_duration_min))
-            travel_s = max(30.0, (r1.stay_datetime - depart).total_seconds())
+            depart = r0_dt + timedelta(minutes=float(r0_dur))
+            travel_s = max(30.0, (r1_dt - depart).total_seconds())
             dist_m = haversine_m(la1, lo1, la2, lo2)
             speed_kmh = dist_m / travel_s * 3.6
 
@@ -901,7 +1017,7 @@ for k, v in [
     ("_gps_file_key", None),
     ("plateau_road_segs", None), ("plateau_road_G", None),
     ("plateau_road_arr", None), ("plateau_road_kid", None),
-    ("road_route_df", None),
+    ("road_sp_graph", None), ("road_route_df", None),
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -948,7 +1064,7 @@ with col_up:
                     "_gps_file_key": _fkey,
                     "plateau_road_segs": None, "plateau_road_G": None,
                     "plateau_road_arr": None, "plateau_road_kid": None,
-                    "road_route_df": None,
+                    "road_sp_graph": None, "road_route_df": None,
                 })
                 st.success(f"✅ {len(df_tmp):,} レコード / {df_tmp['member_id'].nunique():,} メンバー")
 
@@ -1016,9 +1132,8 @@ if not store_visitors:
 st.divider()
 st.header("② 前夜宿泊ホテル分析")
 
-col_h1, col_h2, col_h3 = st.columns(3)
-with col_h1:
-    hotel_search_r = st.slider("ホテル検索範囲 (m)", 500, 5000, 2000, step=100)
+hotel_search_r = 2000
+col_h2, col_h3 = st.columns(2)
 with col_h2:
     hotel_match_r  = st.slider("ホテル GPS マッチ半径 (m)", 50, 300, 150, step=25)
 with col_h3:
@@ -1287,48 +1402,63 @@ elif mode == "🗺️ 来店直前の経路特定":
     st.divider()
     st.header("④ 来店直前の経路特定")
     st.caption(
-        "百貨店到着前の GPS 移動軌跡を可視化し、チラシ・ポスター配布の最適場所を特定します。\n"
-        "※ 本デモでは GPS 滞在点の時系列連結による簡易経路近似を使用しています。"
-        "Plateau 道路データへのマップマッチングは別途実装可能です。"
+        "百貨店到着前の GPS 滞留点を OSM 道路ネットワーク上にスナップし、"
+        "Dijkstra 最短経路で道路沿いの移動経路を推定します。"
+        "チラシ・ポスター配布の最適場所を特定します。"
     )
-
-    # ── Plateau 道路ネットワーク取得 ──────────────────────────────────────────
-    st.subheader("🗺️ Plateau 道路データ取得")
-    plateau_r = st.slider("道路取得範囲 (m)", 300, 2000, 800, step=100,
-                           key="plateau_road_r")
-    fetch_roads_btn = st.button("🏗️ Plateau 道路データ取得", type="secondary")
-    if fetch_roads_btn:
-        with st.spinner("Plateau から道路データを取得中（初回は数十秒かかります）..."):
-            segs, msg = fetch_plateau_roads(store_lat, store_lon, plateau_r)
-        st.info(msg)
-        if segs:
-            G, node_arr, node_kid = build_road_network(segs)
-            st.session_state["plateau_road_segs"] = segs
-            st.session_state["plateau_road_G"]    = G
-            st.session_state["plateau_road_arr"]  = node_arr
-            st.session_state["plateau_road_kid"]  = node_kid
-            st.session_state["road_route_df"]     = None
-            st.metric("道路ノード数", f"{len(node_kid):,}")
-            st.metric("道路エッジ数", f"{G.number_of_edges():,}")
 
     col_ra, col_rb = st.columns(2)
     with col_ra:
         pre_min   = st.slider("来店前の分析時間窓 (分)", 10, 60, 30, step=5)
+        osm_r     = st.slider("道路取得範囲 (m)", 300, 2000, 800, step=100,
+                               key="osm_road_r",
+                               help="OSM から取得する道路ネットワークの範囲")
     with col_rb:
         route_thr = st.slider("表示閾値（訪問者の %）", 0.5, 30.0, 5.0, step=0.5)
-
-    dooh_near_r = st.slider("経路沿い DOOH 抽出半径 (m)", 100, 800, 400, step=50,
-                             help="確定した経路セグメントの中点からこの距離内の Liveboard DOOH のみを抽出します")
+        dooh_near_r = st.slider("経路沿い DOOH 抽出半径 (m)", 100, 800, 400, step=50,
+                                 help="確定経路セグメント中点からこの距離内の Liveboard DOOH を抽出")
 
     run_route = st.button("▶ 経路分析 + DOOH 抽出実行", type="primary")
     if run_route:
+        # OSM 道路ネットワーク取得
+        with st.spinner("OSM から道路ネットワークを取得中..."):
+            osm_segs, osm_msg = fetch_osm_roads(store_lat, store_lon, osm_r)
+        if osm_segs:
+            G, node_arr, node_kid, sp_graph = build_road_network(osm_segs)
+            st.session_state["plateau_road_G"]   = G
+            st.session_state["plateau_road_arr"] = node_arr
+            st.session_state["plateau_road_kid"] = node_kid
+            st.session_state["road_sp_graph"]    = sp_graph
+            st.session_state["road_route_df"]    = None
+        else:
+            st.warning(f"道路データ取得失敗: {osm_msg} — GPS 点列経路のみ表示します。")
+            st.session_state["plateau_road_G"] = None
+
+        # GPS セグメント分析
         with st.spinner("経路分析中..."):
             segs = analyze_pre_arrival_routes(
                 gps_df, store_visits_df, store_lat, store_lon,
                 pre_minutes=pre_min, threshold_pct=route_thr,
             )
         st.session_state["route_segs_df"] = segs
-        st.session_state["route_dooh_df"] = None  # 経路変更時はリセット
+        st.session_state["route_dooh_df"] = None
+
+        # 道路ベース経路計算
+        _G      = st.session_state.get("plateau_road_G")
+        _arr    = st.session_state.get("plateau_road_arr")
+        _kid    = st.session_state.get("plateau_road_kid")
+        _sp     = st.session_state.get("road_sp_graph")
+        if _G is not None and _arr is not None and _arr.shape[0] > 0 and not segs.empty:
+            with st.spinner("道路ネットワーク上で最短経路を計算中..."):
+                rdf = compute_road_routes(
+                    gps_df, store_visits_df, _G, _arr, _kid,
+                    store_lat, store_lon,
+                    pre_minutes=pre_min, threshold_pct=route_thr,
+                    sp_graph=_sp,
+                )
+            st.session_state["road_route_df"] = rdf
+            st.info(f"{osm_msg} ／ 道路エッジ {_G.number_of_edges():,} 本")
+
         if not segs.empty:
             with st.spinner("Liveboard から経路沿い DOOH を抽出中..."):
                 _all_dooh = load_dooh_df()
@@ -1392,83 +1522,59 @@ elif mode == "🗺️ 来店直前の経路特定":
         )
         st.plotly_chart(fig_spd, use_container_width=True)
 
-    # ── 経路地図（速度別色分け） ──────────────────────────────────────────────
-    st.subheader("🗺️ 来店前経路マップ")
-    st.caption(
-        "🟢 緑: 低速（歩行）｜🟠 オレンジ: 中速｜🔴 赤: 高速（乗り物）"
-        "  ／  🔵 ブルー細線: 逆方向・横断  ｜  線幅 = 通行者数に比例"
-    )
-
-    fig_rt = go.Figure()
-    max_cnt = segs_df["count"].max() or 1
-    has_speed = "dominant_speed" in segs_df.columns
-
-    # ── 来店方向: 支配的速度カテゴリで色分け ─────────────────────────────────
-    if has_speed:
-        for spd_cat, color in SPEED_COLORS.items():
-            grp = app_segs[app_segs["dominant_speed"] == spd_cat]
-            for _, seg in grp.iterrows():
-                w = max(1.5, min(10, seg["count"] / max_cnt * 10))
-                fig_rt.add_trace(go.Scattermapbox(
-                    lat=[seg.lat1, seg.lat2], lon=[seg.lon1, seg.lon2],
-                    mode="lines", line=dict(color=color, width=w),
-                    hovertemplate=(
-                        f"→ 店舗方向 [{spd_cat}]<br>"
-                        f"{seg['count']} 人 ({seg['pct']:.1f}%)<br>"
-                        f"低速:{int(seg['低速'])} 中速:{int(seg['中速'])} 高速:{int(seg['高速'])}"
-                        "<extra></extra>"
-                    ),
-                    showlegend=False,
-                ))
-        # 凡例ダミー（速度別）
-        for spd_cat, color in SPEED_COLORS.items():
-            fig_rt.add_trace(go.Scattermapbox(
-                lat=[store_lat], lon=[store_lon], mode="markers",
-                marker=dict(size=0, opacity=0),
-                name=f"→ 店舗方向 [{spd_cat}]", showlegend=True,
-                line=dict(color=color),
+    # ── 道路ベース経路マップ（OSM マップマッチング） ──────────────────────────
+    rdf: pd.DataFrame = st.session_state.get("road_route_df")
+    if rdf is not None and not rdf.empty:
+        st.subheader("🛣️ 来店前経路マップ（OSM 道路ベース）")
+        st.caption("🟢 緑: 店舗方向  ｜  🔵 ブルー: 逆方向・横断  ｜  線幅 = 通行者数に比例")
+        fig_road = go.Figure()
+        max_c = rdf["count"].max() or 1
+        # 店舗方向・逆方向それぞれ None 区切りで1トレースにまとめる（高速化）
+        for approaching, color, label in [
+            (True,  "rgba(39,174,96,0.85)",  "→ 店舗方向"),
+            (False, "rgba(52,152,219,0.50)", "← 逆方向"),
+        ]:
+            grp = rdf[rdf["approaching"] == approaching]
+            if grp.empty:
+                continue
+            lats, lons, hover = [], [], []
+            for _, row in grp.iterrows():
+                tip = (f"{label}<br>{row['count']} 人 ({row['pct']:.1f}%)"
+                       "<extra></extra>")
+                lats += [row.lat1, row.lat2, None]
+                lons += [row.lon1, row.lon2, None]
+                hover += [tip, tip, None]
+            # 線幅は通行者数の中央値で代表（バッチ化のトレードオフ）
+            med_w = float(grp["count"].median() / max_c * 8)
+            w = max(2.0, min(9.0, med_w))
+            fig_road.add_trace(go.Scattermapbox(
+                lat=lats, lon=lons,
+                mode="lines",
+                line=dict(color=color, width=w),
+                hovertemplate=hover,
+                name=label,
+                showlegend=True,
             ))
-    else:
-        # フォールバック（速度列なし）
-        for _, seg in app_segs.iterrows():
-            w = max(1.5, min(10, seg["count"] / max_cnt * 10))
-            fig_rt.add_trace(go.Scattermapbox(
-                lat=[seg.lat1, seg.lat2], lon=[seg.lon1, seg.lon2],
-                mode="lines", line=dict(color="rgba(230,126,34,0.80)", width=w),
-                hovertemplate=f"→ 店舗方向<br>{seg['count']} 人 ({seg['pct']:.1f}%)<extra></extra>",
-                showlegend=False,
-            ))
-
-    # ── 逆方向・横断（ブルー細線） ────────────────────────────────────────────
-    non_app = segs_df[~segs_df["approaching"]]
-    for _, seg in non_app.iterrows():
-        w = max(1.0, min(5, seg["count"] / max_cnt * 5))
-        fig_rt.add_trace(go.Scattermapbox(
-            lat=[seg.lat1, seg.lat2], lon=[seg.lon1, seg.lon2],
-            mode="lines", line=dict(color="rgba(52,152,219,0.55)", width=w),
-            hovertemplate=f"← 逆方向<br>{seg['count']} 人 ({seg['pct']:.1f}%)<extra></extra>",
-            showlegend=False,
+        fig_road.add_trace(go.Scattermapbox(
+            lat=[store_lat], lon=[store_lon], mode="markers+text",
+            marker=dict(size=20, color="#e74c3c", symbol="star"),
+            text=[store_name], textposition="top right", name=store_name,
         ))
-    fig_rt.add_trace(go.Scattermapbox(
-        lat=[store_lat], lon=[store_lon], mode="markers",
-        marker=dict(size=0, opacity=0), name="← 逆方向・横断", showlegend=True,
-    ))
-
-    # 百貨店
-    fig_rt.add_trace(go.Scattermapbox(
-        lat=[store_lat], lon=[store_lon], mode="markers+text",
-        marker=dict(size=20, color="#e74c3c", symbol="star"),
-        text=[store_name], textposition="top right", name=store_name,
-    ))
-
-    fig_rt.update_layout(
-        mapbox=dict(style="open-street-map",
-                    center=dict(lat=store_lat, lon=store_lon), zoom=15),
-        height=580, margin=dict(r=0, t=0, l=0, b=0),
-        legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01,
-                    bgcolor="rgba(255,255,255,0.9)"),
-    )
-    st.plotly_chart(fig_rt, use_container_width=True)
+        fig_road.update_layout(
+            mapbox=dict(style="open-street-map",
+                        center=dict(lat=store_lat, lon=store_lon), zoom=16),
+            height=580, margin=dict(r=0, t=0, l=0, b=0),
+            legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01,
+                        bgcolor="rgba(255,255,255,0.9)"),
+        )
+        st.plotly_chart(fig_road, use_container_width=True)
+        app_road = rdf[rdf["approaching"]]
+        st.caption(
+            f"店舗方向エッジ: {len(app_road)} 本 ／ 全エッジ: {len(rdf)} 本"
+            f"（閾値 {route_thr}% 以上）"
+        )
+    else:
+        st.info("道路データの取得に失敗しました。再度「経路分析 + DOOH 抽出実行」を押してください。")
 
     # ── 経路沿い DOOH 抽出結果 ────────────────────────────────────────────────
     route_dooh_df: pd.DataFrame = st.session_state.get("route_dooh_df")
@@ -1534,10 +1640,17 @@ elif mode == "🗺️ 来店直前の経路特定":
     # ── 配布推奨ポイント ──────────────────────────────────────────────────────
     st.divider()
     st.subheader("💡 チラシ・ポスター配布 推奨ポイント（店舗方向通行 上位 5 箇所）")
-    top5 = segs_df[segs_df["approaching"]].head(5)
+    # 道路ベース経路がある場合はそちらの上位セグメントを使用
+    _rdf_top = st.session_state.get("road_route_df")
+    if _rdf_top is not None and not _rdf_top.empty:
+        top5 = _rdf_top[_rdf_top["approaching"]].head(5)
+    else:
+        top5 = segs_df[segs_df["approaching"]].head(5)
+
     if top5.empty:
         st.info("店舗方向の有効セグメントが見つかりませんでした。")
     else:
+        # テキスト一覧
         for rank, (_, seg) in enumerate(top5.iterrows(), 1):
             mid_lat = (seg.lat1 + seg.lat2) / 2
             mid_lon = (seg.lon1 + seg.lon2) / 2
@@ -1546,6 +1659,45 @@ elif mode == "🗺️ 来店直前の経路特定":
                 f" ― **{seg['count']} 人通行** ({seg['pct']:.1f}%) ｜ "
                 f"方位 {seg['bearing']:.0f}° → 店舗方向"
             )
+
+        # 配布ポイント地図
+        fig_flyer = go.Figure()
+        max_cnt_f = top5["count"].max() or 1
+        for rank, (_, seg) in enumerate(top5.iterrows(), 1):
+            w = max(2, min(10, seg["count"] / max_cnt_f * 10))
+            fig_flyer.add_trace(go.Scattermapbox(
+                lat=[seg.lat1, seg.lat2], lon=[seg.lon1, seg.lon2],
+                mode="lines", line=dict(color="rgba(230,126,34,0.65)", width=w),
+                hoverinfo="skip", showlegend=False,
+            ))
+        mid_lats = [(seg.lat1 + seg.lat2) / 2 for _, seg in top5.iterrows()]
+        mid_lons = [(seg.lon1 + seg.lon2) / 2 for _, seg in top5.iterrows()]
+        hover_texts = [
+            f"{rank}位: {int(seg['count'])} 人通行 ({seg['pct']:.1f}%)"
+            for rank, (_, seg) in enumerate(top5.iterrows(), 1)
+        ]
+        label_texts = [f"{rank}位" for rank in range(1, len(top5) + 1)]
+        fig_flyer.add_trace(go.Scattermapbox(
+            lat=mid_lats, lon=mid_lons,
+            mode="markers+text",
+            marker=dict(size=18, color="#f39c12", opacity=0.95),
+            text=label_texts, textposition="top right",
+            hovertext=hover_texts, hoverinfo="text",
+            name="📌 配布推奨ポイント",
+        ))
+        fig_flyer.add_trace(go.Scattermapbox(
+            lat=[store_lat], lon=[store_lon], mode="markers+text",
+            marker=dict(size=20, color="#e74c3c", symbol="star"),
+            text=[store_name], textposition="top right", name=store_name,
+        ))
+        fig_flyer.update_layout(
+            mapbox=dict(style="open-street-map",
+                        center=dict(lat=store_lat, lon=store_lon), zoom=16),
+            height=480, margin=dict(r=0, t=0, l=0, b=0),
+            legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01,
+                        bgcolor="rgba(255,255,255,0.9)"),
+        )
+        st.plotly_chart(fig_flyer, use_container_width=True)
 
     # セグメント一覧
     with st.expander("全セグメント一覧（上位 30）"):
@@ -1558,60 +1710,3 @@ elif mode == "🗺️ 来店直前の経路特定":
             cols += ["低速","中速","高速","支配速度"]
         st.dataframe(show[cols], use_container_width=True, hide_index=True)
 
-    # ── Plateau 道路ベース経路 ────────────────────────────────────────────────
-    _G   = st.session_state.get("plateau_road_G")
-    _arr = st.session_state.get("plateau_road_arr")
-    _kid = st.session_state.get("plateau_road_kid")
-
-    if _G is not None and _arr is not None and _arr.shape[0] > 0:
-        st.divider()
-        st.subheader("🛣️ Plateau 道路ベース 推定経路")
-        run_road = st.button("▶ 道路ベース経路を計算", type="primary",
-                             key="run_road_route")
-        if run_road:
-            with st.spinner("道路ネットワーク上で最短経路を計算中..."):
-                rdf = compute_road_routes(
-                    gps_df, store_visits_df, _G, _arr, _kid,
-                    store_lat, store_lon,
-                    pre_minutes=pre_min, threshold_pct=route_thr,
-                )
-            st.session_state["road_route_df"] = rdf
-
-        rdf: pd.DataFrame = st.session_state.get("road_route_df")
-        if rdf is not None and not rdf.empty:
-            app_r = rdf[rdf["approaching"]]
-            st.caption(
-                f"店舗方向エッジ: {len(app_r)} 本 ／ "
-                f"全エッジ: {len(rdf)} 本（閾値 {route_thr}% 以上）"
-            )
-            fig_road = go.Figure()
-            max_c = rdf["count"].max() or 1
-            for _, row in rdf.iterrows():
-                color = ("rgba(39,174,96,0.85)" if row["approaching"]
-                         else "rgba(52,152,219,0.50)")
-                w = max(1.5, min(10, row["count"] / max_c * 10))
-                fig_road.add_trace(go.Scattermapbox(
-                    lat=[row.lat1, row.lat2], lon=[row.lon1, row.lon2],
-                    mode="lines", line=dict(color=color, width=w),
-                    hovertemplate=(
-                        f"{'→ 店舗方向' if row['approaching'] else '← 逆方向'}"
-                        f"<br>{row['count']} 人 ({row['pct']:.1f}%)<extra></extra>"
-                    ),
-                    showlegend=False,
-                ))
-            fig_road.add_trace(go.Scattermapbox(
-                lat=[store_lat], lon=[store_lon], mode="markers+text",
-                marker=dict(size=20, color="#e74c3c", symbol="star"),
-                text=[store_name], textposition="top right", name=store_name,
-            ))
-            fig_road.update_layout(
-                mapbox=dict(style="open-street-map",
-                            center=dict(lat=store_lat, lon=store_lon), zoom=16),
-                height=560, margin=dict(r=0, t=0, l=0, b=0),
-                legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01,
-                            bgcolor="rgba(255,255,255,0.9)"),
-            )
-            st.plotly_chart(fig_road, use_container_width=True)
-            st.caption("🟢 緑: 店舗方向  ｜  🔵 ブルー: 逆方向・横断  ｜  線幅 = 通行者数")
-        elif rdf is not None and rdf.empty:
-            st.warning("閾値を超える道路経路が見つかりませんでした。閾値を下げてください。")
