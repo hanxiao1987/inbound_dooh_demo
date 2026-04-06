@@ -1603,10 +1603,12 @@ elif mode == "🗺️ 来店直前の経路特定":
         for rank, (_, seg) in enumerate(top5.iterrows(), 1):
             mid_lat = (seg.lat1 + seg.lat2) / 2
             mid_lon = (seg.lon1 + seg.lon2) / 2
+            brg = seg["bearing"] if "bearing" in seg.index else bearing_deg(
+                seg.lat1, seg.lon1, seg.lat2, seg.lon2)
             st.markdown(
                 f"**{rank}位** 座標 ({mid_lat:.5f}, {mid_lon:.5f})"
                 f" ― **{seg['count']} 人通行** ({seg['pct']:.1f}%) ｜ "
-                f"方位 {seg['bearing']:.0f}° → 店舗方向"
+                f"方位 {brg:.0f}° → 店舗方向"
             )
 
         # 配布ポイント地図
