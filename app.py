@@ -1475,7 +1475,7 @@ elif mode == "🗺️ 来店直前の経路特定":
     rdf: pd.DataFrame = st.session_state.get("road_route_df")
     if rdf is not None and not rdf.empty:
         st.subheader("🛣️ 来店前経路マップ（OSM 道路ベース）")
-        st.caption("🟢 緑: 店舗方向  ｜  🔵 ブルー: 逆方向・横断  ｜  線幅 = 通行者数に比例")
+        st.caption("🔴 赤: 店舗方向 ｜ 🔵 ブルー: 逆方向・横断 ｜ 線幅 = 通行者数に比例")
         fig_road = go.Figure()
         max_c = rdf["count"].max() or 1
         # 店舗方向・逆方向それぞれ None 区切りで1トレースにまとめる（高速化）
