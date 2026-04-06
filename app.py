@@ -810,7 +810,6 @@ def build_sankey(passages_df: pd.DataFrame,
 SPEED_LOW_KMH  = 5.0   # ≤ 5 km/h : 低速（歩行・停滞）
 SPEED_MID_KMH  = 15.0  # 5‒15 km/h: 中速（早歩き・自転車）
                         # > 15 km/h: 高速（乗り物）
-あなたのプロンプト
 SPEED_COLORS = {
     "低速": "rgba(39,174,96,0.85)",   # 緑: 歩行 ← DOOH 訴求に最適
     "中速": "rgba(230,126,34,0.80)",  # オレンジ: 早歩き
