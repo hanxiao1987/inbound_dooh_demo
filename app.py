@@ -960,9 +960,9 @@ st.header("① 百貨店設定 & GPS データ入力")
 col_cfg, col_up = st.columns(2)
 with col_cfg:
     st.subheader("百貨店中心点")
-    store_name   = st.text_input("百貨店名",  value="松屋銀座")
-    store_lat    = st.number_input("緯度",     value=35.6722, format="%.6f", step=0.0001)
-    store_lon    = st.number_input("経度",     value=139.7658, format="%.6f", step=0.0001)
+    store_name   = st.text_input("百貨店名",  value="新宿高島屋")
+    store_lat    = st.number_input("緯度",     value=35.68784, format="%.6f", step=0.0001)
+    store_lon    = st.number_input("経度",     value=139.70231, format="%.6f", step=0.0001)
     store_radius = st.slider("訪問判定半径 (m)", 50, 500, 150, step=25)
     min_visit    = st.slider("最低滞在時間 (分)", 1, 60, 5, step=1)
 
